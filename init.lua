@@ -340,7 +340,22 @@ _G.windowDragger = hs.eventtap.new({ EV_DOWN, EV_DRAG, EV_UP }, function(event)
             hs.window.animationDuration = 0
             dragState.x, dragState.y = cx, cy
             dragState.w, dragState.h = saved.w, saved.h
+            -- Freeze drag movement for the duration of the animation so live
+            -- delta events don't fight the in-progress transition.
+            dragState.animating = true
+            local frozenWin = dragState.window
+            hs.timer.doAfter(ANIMATE_DURATION, function()
+                if dragState.window == frozenWin then
+                    dragState.animating = false
+                    -- Re-anchor position to actual window frame so first post-animation
+                    -- delta applies from the right baseline.
+                    local f = frozenWin:frame()
+                    dragState.x, dragState.y = f.x, f.y
+                end
+            end)
         end
+
+        if dragState.animating then return true end
 
         local screen = screenForPoint(hs.mouse.absolutePosition())
         dragState.minX, dragState.maxX, dragState.minY, dragState.maxY =
