@@ -3,7 +3,7 @@
 -- Hyper + left-click ×2:        maximize; restore only if still at the maximized position,
 --                               otherwise maximize again from wherever the window currently is
 -- Title-bar drag (plain) on a window we maximized: restore to pre-maximize size
--- Hyper = Left Cmd + Left Ctrl + Left Opt + Left Shift
+-- Modifier = configurable (see MODIFIER below; default is Hyper: Cmd+Ctrl+Opt+Shift)
 -- Auto-reloads when any file in ~/.hammerspoon/ is saved
 
 -- ── Auto-reload on save ───────────────────────────────────────────────────────
@@ -40,6 +40,12 @@ local MIN_WIN_H             = 100
 local MIN_VISIBLE_X         = 100  -- min px of window width that must remain on-screen horizontally
 local MIN_VISIBLE_Y         = 30   -- min px of window height that must remain on-screen vertically
 
+-- Modifiers that must be held to activate window management.
+-- Default is the Hyper key (all four). To use a lighter combo, remove entries:
+--   Cmd + Ctrl only:       { cmd = true, ctrl = true }
+--   Cmd + Ctrl + Opt:      { cmd = true, ctrl = true, alt = true }
+local MODIFIER = { cmd = true, ctrl = true, alt = true, shift = true }
+
 local dragState = {}
 local lastClick = { time = 0, winId = nil }
 
@@ -59,9 +65,14 @@ end)
 -- (e.g. Karabiner-Elements) can introduce: the click event sometimes arrives before
 -- all four modifier flags are reflected in the event itself.
 local function isHyper(flags)
-    if flags.cmd and flags.ctrl and flags.alt and flags.shift then return true end
-    local live = hs.eventtap.checkKeyboardModifiers()
-    return live.cmd and live.ctrl and live.alt and live.shift
+    local function checkMods(m)
+        for mod in pairs(MODIFIER) do
+            if not m[mod] then return false end
+        end
+        return true
+    end
+    if checkMods(flags) then return true end
+    return checkMods(hs.eventtap.checkKeyboardModifiers())
 end
 
 -- buffer > 0 when Hyper is held so clicks in the native resize handle zone
