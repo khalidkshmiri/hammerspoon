@@ -7,3 +7,4 @@ hs.alert.show("Config loaded")
 
 -- ── Modules ───────────────────────────────────────────────────────────────────
 require("modules.window_manager")
+require("modules.brightness_manager")
