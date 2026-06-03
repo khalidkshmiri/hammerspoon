@@ -22,3 +22,21 @@ changing anything. The breaking change was in the uncommitted working tree, not 
 When the user says something "used to work": read git history first, diff against the last
 working commit, identify what changed. Do not theorize and do not add new mechanisms before
 understanding what broke.
+
+---
+
+## init.lua — pathwatcher watching symlink path instead of real path
+
+`~/.hammerspoon/init.lua` and `~/.hammerspoon/modules` are symlinks into
+`~/Developer/hammerspoon/`. The pathwatcher was watching `~/.hammerspoon/` using
+`os.getenv("HOME") .. "/.hammerspoon/"`. FSEvents fires on real paths, not symlink paths,
+so saving any file in the project directory never triggered a reload.
+
+**What should have happened**
+Check `ls -la ~/.hammerspoon` before assuming the watcher path is correct. A one-second
+inspection would have shown the symlinks. The fix is `hs.configdir` which Hammerspoon
+resolves to the real directory automatically.
+
+**Rule**
+When a file watcher isn't firing, check whether the watched path is a symlink before
+anything else.
