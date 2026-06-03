@@ -2,7 +2,8 @@ package.loaded["modules.window_manager"] = nil
 
 -- ── Window dragger / resizer + maximize toggle ────────────────────────────────
 if _G.windowDragger then _G.windowDragger:stop() end
-if _G.windowFilter then _G.windowFilter:unsubscribeAll() end
+if _G.hyperWatcher  then _G.hyperWatcher:stop()  end
+if _G.windowFilter  then _G.windowFilter:unsubscribeAll() end
 
 -- Clean up any canvas left over from a previous load (e.g. config saved mid-resize).
 -- dragState is local so its canvas would otherwise be orphaned and stuck on screen.
@@ -36,9 +37,19 @@ local MIN_VISIBLE_Y         = 30   -- min px of window height that must remain o
 --   Cmd + Ctrl + Opt:      { cmd = true, ctrl = true, alt = true }
 local MODIFIER = { cmd = true, ctrl = true, alt = true, shift = true }
 
-local dragState = {}
-local dragGen   = 0
-local lastClick = { time = 0, winId = nil }
+local dragState   = {}
+local dragGen     = 0
+local lastClick   = { time = 0, winId = nil }
+-- Hyper state tracked via flagsChanged so click events don't race with Karabiner-Elements
+-- synthetic modifier delivery. The click event's own flags can arrive before all four
+-- modifier keys are reflected, causing isHyper to return false and the click to fall
+-- through to macOS native handling — which fires "Option hides other apps."
+local hyperActive = false
+_G.hyperWatcher = hs.eventtap.new({ hs.eventtap.event.types.flagsChanged }, function(ev)
+    local f = ev:getFlags()
+    hyperActive = (f.cmd and f.ctrl and f.alt and f.shift) == true
+end)
+_G.hyperWatcher:start()
 
 -- savedFrames[winId] = { pre = frame_before_maximize, max = frame_we_set_at_maximize }
 -- Cleared when the user drags, resizes, or Hyper+double-clicks to restore.
@@ -51,20 +62,7 @@ _G.windowFilter:subscribe(hs.window.filter.windowDestroyed, function(win)
     if id and savedFrames[id] then savedFrames[id] = nil end
 end)
 
--- Returns true when all four Hyper modifiers are held.
--- Falls back to a live keyboard poll to handle the timing gap that Hyper-key remappers
--- (e.g. Karabiner-Elements) can introduce: the click event sometimes arrives before
--- all four modifier flags are reflected in the event itself.
-local function isHyper(flags)
-    local function checkMods(m)
-        for mod in pairs(MODIFIER) do
-            if not m[mod] then return false end
-        end
-        return true
-    end
-    if checkMods(flags) then return true end
-    return checkMods(hs.eventtap.checkKeyboardModifiers())
-end
+local function isHyper() return hyperActive end
 
 -- buffer > 0 when Hyper is held so clicks in the native resize handle zone
 -- (a few px outside the logical frame) still find the window.
@@ -174,8 +172,7 @@ _G.windowDragger = hs.eventtap.new({ EV_DOWN, EV_DRAG, EV_UP }, function(event)
     -- ── Mouse down ───────────────────────────────────────────────────────────
     if eventType == EV_DOWN then
         dragState = {}
-        local flags    = event:getFlags()
-        local hasHyper = isHyper(flags)
+        local hasHyper = isHyper()
         local pos      = event:location()
 
         -- Fast path: skip the expensive window lookup when nothing to intercept
@@ -213,7 +210,6 @@ _G.windowDragger = hs.eventtap.new({ EV_DOWN, EV_DRAG, EV_UP }, function(event)
                 didDrag    = false,
                 savedFrame = savedFrames[winId].pre,
             }
-            win:focus()
             return true
         end
 
@@ -256,6 +252,7 @@ _G.windowDragger = hs.eventtap.new({ EV_DOWN, EV_DRAG, EV_UP }, function(event)
         -- Single Hyper+click: arm a move drag
         dragGen = dragGen + 1
         local minX, maxX, minY, maxY = boundsOnScreen(win:screen(), f.w, f.h)
+
         dragState = {
             window     = win,
             x = f.x,   y = f.y,
