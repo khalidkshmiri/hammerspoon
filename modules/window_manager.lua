@@ -2,6 +2,7 @@ package.loaded["modules.window_manager"] = nil
 
 -- ── Window dragger / resizer + maximize toggle ────────────────────────────────
 if _G.windowDragger then _G.windowDragger:stop() end
+if _G.windowFilter then _G.windowFilter:unsubscribeAll() end
 
 -- Clean up any canvas left over from a previous load (e.g. config saved mid-resize).
 -- dragState is local so its canvas would otherwise be orphaned and stuck on screen.
@@ -36,6 +37,7 @@ local MIN_VISIBLE_Y         = 30   -- min px of window height that must remain o
 local MODIFIER = { cmd = true, ctrl = true, alt = true, shift = true }
 
 local dragState = {}
+local dragGen   = 0
 local lastClick = { time = 0, winId = nil }
 
 -- savedFrames[winId] = { pre = frame_before_maximize, max = frame_we_set_at_maximize }
@@ -43,8 +45,8 @@ local lastClick = { time = 0, winId = nil }
 local savedFrames = {}
 
 -- Clean up savedFrames when a window is closed so the table doesn't grow indefinitely.
-local windowFilter = hs.window.filter.default
-windowFilter:subscribe(hs.window.filter.windowDestroyed, function(win)
+_G.windowFilter = hs.window.filter.new()
+_G.windowFilter:subscribe(hs.window.filter.windowDestroyed, function(win)
     local id = win:id()
     if id and savedFrames[id] then savedFrames[id] = nil end
 end)
@@ -146,6 +148,12 @@ local function deleteResizeCanvas(c)
 end
 
 -- Returns true if the window's current frame is still at the position we maximized it to.
+local function withAnimation(fn)
+    hs.window.animationDuration = ANIMATE_DURATION
+    fn()
+    hs.window.animationDuration = 0
+end
+
 local function isStillMaximized(winId, currentF)
     if not savedFrames[winId] then return false end
     local m = savedFrames[winId].max
@@ -156,9 +164,7 @@ end
 local function doMaximize(win, winId, currentF)
     local maxF = win:screen():frame()
     savedFrames[winId] = { pre = currentF, max = maxF }
-    hs.window.animationDuration = ANIMATE_DURATION
-    win:maximize()
-    hs.window.animationDuration = 0
+    withAnimation(function() win:maximize() end)
     win:focus()
 end
 
@@ -238,10 +244,9 @@ _G.windowDragger = hs.eventtap.new({ EV_DOWN, EV_DRAG, EV_UP }, function(event)
         if lastClick.winId == winId and (now - lastClick.time) < DOUBLE_CLICK_INTERVAL then
             lastClick = { time = 0, winId = nil }
             if isStillMaximized(winId, f) then
-                hs.window.animationDuration = ANIMATE_DURATION
-                win:setFrame(savedFrames[winId].pre)
-                hs.window.animationDuration = 0
+                local pre = savedFrames[winId].pre
                 savedFrames[winId] = nil
+                withAnimation(function() win:setFrame(pre) end)
             else
                 doMaximize(win, winId, f)
             end
@@ -249,6 +254,7 @@ _G.windowDragger = hs.eventtap.new({ EV_DOWN, EV_DRAG, EV_UP }, function(event)
         end
 
         -- Single Hyper+click: arm a move drag
+        dragGen = dragGen + 1
         local minX, maxX, minY, maxY = boundsOnScreen(win:screen(), f.w, f.h)
         dragState = {
             window     = win,
@@ -324,17 +330,19 @@ _G.windowDragger = hs.eventtap.new({ EV_DOWN, EV_DRAG, EV_UP }, function(event)
             local rminX, rmaxX, rminY, rmaxY = boundsOnScreen(rs, saved.w, saved.h)
             local cx     = max(rminX, min(rx, rmaxX))
             local cy     = max(rminY, min(ry, rmaxY))
-            hs.window.animationDuration = ANIMATE_DURATION
-            dragState.window:setFrame({ x = cx, y = cy, w = saved.w, h = saved.h })
-            hs.window.animationDuration = 0
+            local frozenWin = dragState.window
+            withAnimation(function()
+                frozenWin:setFrame({ x = cx, y = cy, w = saved.w, h = saved.h })
+            end)
             dragState.x, dragState.y = cx, cy
             dragState.w, dragState.h = saved.w, saved.h
             -- Freeze drag movement for the duration of the animation so live
             -- delta events don't fight the in-progress transition.
             dragState.animating = true
-            local frozenWin = dragState.window
+            dragGen = dragGen + 1
+            local myGen = dragGen
             hs.timer.doAfter(ANIMATE_DURATION, function()
-                if dragState.window == frozenWin then
+                if dragGen == myGen then
                     dragState.animating = false
                     -- Re-anchor position to actual window frame so first post-animation
                     -- delta applies from the right baseline.
