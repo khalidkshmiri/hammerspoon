@@ -5,12 +5,6 @@ if _G.windowDragger then _G.windowDragger:stop() end
 if _G.hyperWatcher  then _G.hyperWatcher:stop()  end
 if _G.windowFilter  then _G.windowFilter:unsubscribeAll() end
 
--- Clean up any canvas left over from a previous load (e.g. config saved mid-resize).
--- dragState is local so its canvas would otherwise be orphaned and stuck on screen.
-if _G.activeResizeCanvas then
-    pcall(function() _G.activeResizeCanvas:delete() end)
-    _G.activeResizeCanvas = nil
-end
 
 hs.window.animationDuration = 0
 local ANIMATE_DURATION = 0.2  -- seconds for maximize / restore transitions (drag stays instant)
@@ -137,34 +131,6 @@ end
 local function boundsOnScreen(screen, w, h)
     local sf = screen:frame()
     return sf.x - w + MIN_VISIBLE_X, sf.x + sf.w - MIN_VISIBLE_X, sf.y, sf.y + sf.h - MIN_VISIBLE_Y
-end
-
--- Semi-transparent overlay that tracks the mouse during resize.
--- The actual window AX call happens once on mouse-up, keeping drag smooth.
--- Also registers the canvas globally so reload can clean it up if needed.
-local function makeResizeCanvas(frame)
-    local c = hs.canvas.new(frame)
-    c:insertElement({
-        action    = "fill",
-        type      = "rectangle",
-        fillColor = { red = 0.2, green = 0.2, blue = 0.2, alpha = 0.35 },
-        roundedRectRadii = { xRadius = 6, yRadius = 6 },
-    })
-    c:insertElement({
-        action      = "stroke",
-        type        = "rectangle",
-        strokeColor = { white = 1, alpha = 0.5 },
-        strokeWidth = 2,
-        roundedRectRadii = { xRadius = 6, yRadius = 6 },
-    })
-    c:show()
-    _G.activeResizeCanvas = c
-    return c
-end
-
-local function deleteResizeCanvas(c)
-    pcall(function() c:delete() end)
-    _G.activeResizeCanvas = nil
 end
 
 -- Returns true if the window's current frame is still at the position we maximized it to.
@@ -434,6 +400,7 @@ _G.windowDragger = hs.eventtap.new({ EV_DOWN, EV_DRAG, EV_UP, EV_RDOWN, EV_RDRAG
     -- ── Right mouse down: Hyper+right-drag = resize from nearest corner ───────
     -- Divides the window into four quadrants; the quadrant the cursor is in
     -- determines which corner gets dragged. Works from anywhere in the window.
+    -- Uses the same 60fps timer approach as Hyper+left-drag edge resize.
     elseif eventType == EV_RDOWN then
         dragState = {}
         if not isHyper() then return end
@@ -443,10 +410,10 @@ _G.windowDragger = hs.eventtap.new({ EV_DOWN, EV_DRAG, EV_UP, EV_RDOWN, EV_RDRAG
 
         local f     = win:frame()
         local winId = win:id()
-        savedFrames[winId] = nil  -- discard any saved maximize state for this window
+        savedFrames[winId] = nil
 
         local initF = { x = f.x, y = f.y, w = f.w, h = f.h }
-        dragState = {
+        local ds = {
             window       = win,
             isResize     = true,
             edges        = quadrantEdges(pos, f),
@@ -455,53 +422,75 @@ _G.windowDragger = hs.eventtap.new({ EV_DOWN, EV_DRAG, EV_UP, EV_RDOWN, EV_RDRAG
             initMouseX   = pos.x,
             initMouseY   = pos.y,
             initFrame    = initF,
-            canvasFrame  = initF,
-            resizeCanvas = makeResizeCanvas(initF),
+            totalDX      = 0,
+            totalDY      = 0,
+            dirty        = false,
         }
+        -- 60fps timer applies accumulated deltas to setFrame, same as scroll/left-drag resize.
+        ds.resizeTimer = hs.timer.doEvery(1/60, function()
+            if not ds.dirty then return end
+            ds.dirty = false
+            local e     = ds.edges
+            local iF    = ds.initFrame
+            local newX  = iF.x
+            local newY  = iF.y
+            local newW  = iF.w
+            local newH  = iF.h
+            if e.left then
+                newW = max(MIN_WIN_W, iF.w - ds.totalDX)
+                newX = iF.x + iF.w - newW
+            elseif e.right then
+                newW = max(MIN_WIN_W, iF.w + ds.totalDX)
+            end
+            if e.top then
+                newH = max(MIN_WIN_H, iF.h - ds.totalDY)
+                newY = iF.y + iF.h - newH
+            elseif e.bottom then
+                newH = max(MIN_WIN_H, iF.h + ds.totalDY)
+            end
+            pcall(ds.window.setFrame, ds.window, { x = newX, y = newY, w = newW, h = newH })
+        end)
+        dragState = ds
         return true
 
-    -- ── Right mouse drag: update resize canvas ────────────────────────────────
+    -- ── Right mouse drag: accumulate delta for 60fps timer ───────────────────
     elseif eventType == EV_RDRAG then
         if not dragState.window or not dragState.isResize then return end
         dragState.didDrag = true
-
-        local curPos  = event:location()
-        local totalDX = curPos.x - dragState.initMouseX
-        local totalDY = curPos.y - dragState.initMouseY
-        local e       = dragState.edges
-        local initF   = dragState.initFrame
-
-        local newX = initF.x
-        local newY = initF.y
-        local newW = initF.w
-        local newH = initF.h
-
-        if e.left then
-            newW = max(MIN_WIN_W, initF.w - totalDX)
-            newX = initF.x + initF.w - newW
-        elseif e.right then
-            newW = max(MIN_WIN_W, initF.w + totalDX)
-        end
-
-        if e.top then
-            newH = max(MIN_WIN_H, initF.h - totalDY)
-            newY = initF.y + initF.h - newH
-        elseif e.bottom then
-            newH = max(MIN_WIN_H, initF.h + totalDY)
-        end
-
-        local cf = { x = newX, y = newY, w = newW, h = newH }
-        dragState.resizeCanvas:frame(cf)
-        dragState.canvasFrame = cf
+        local curPos      = event:location()
+        dragState.totalDX = curPos.x - dragState.initMouseX
+        dragState.totalDY = curPos.y - dragState.initMouseY
+        dragState.dirty   = true
         return true
 
-    -- ── Right mouse up: commit canvas frame to window ─────────────────────────
+    -- ── Right mouse up: flush final frame and stop timer ─────────────────────
     elseif eventType == EV_RUP then
-        if dragState.window and dragState.resizeCanvas then
-            if dragState.didDrag then
-                pcall(dragState.window.setFrame, dragState.window, dragState.canvasFrame)
+        if dragState.window then
+            if dragState.resizeTimer then
+                -- Final flush so the last drag position is always committed.
+                if dragState.dirty then
+                    local e     = dragState.edges
+                    local iF    = dragState.initFrame
+                    local newX  = iF.x
+                    local newY  = iF.y
+                    local newW  = iF.w
+                    local newH  = iF.h
+                    if e.left then
+                        newW = max(MIN_WIN_W, iF.w - dragState.totalDX)
+                        newX = iF.x + iF.w - newW
+                    elseif e.right then
+                        newW = max(MIN_WIN_W, iF.w + dragState.totalDX)
+                    end
+                    if e.top then
+                        newH = max(MIN_WIN_H, iF.h - dragState.totalDY)
+                        newY = iF.y + iF.h - newH
+                    elseif e.bottom then
+                        newH = max(MIN_WIN_H, iF.h + dragState.totalDY)
+                    end
+                    pcall(dragState.window.setFrame, dragState.window, { x = newX, y = newY, w = newW, h = newH })
+                end
+                dragState.resizeTimer:stop()
             end
-            deleteResizeCanvas(dragState.resizeCanvas)
             dragState = {}
             return true
         end
