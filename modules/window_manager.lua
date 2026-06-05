@@ -46,9 +46,9 @@ local dragState   = {}
 local dragGen     = 0
 local lastClick   = { time = 0, winId = nil }
 -- Scroll gesture target: locked when a scroll starts, released 0.3s after last event.
--- Uses a canvas overlay (like drag) so setFrame is only called once on gesture end,
--- keeping slow-to-resize apps (Xcode, Reminders) perfectly smooth.
-local scrollTarget = { win = nil, timer = nil, edges = nil, initFrame = nil, canvas = nil, totalDX = 0, totalDY = 0 }
+-- The event tap only accumulates deltas; a 60fps timer flushes them to setFrame so
+-- the tap never blocks on slow-to-resize apps (Xcode, Reminders).
+local scrollTarget = { win = nil, releaseTimer = nil, updateTimer = nil, edges = nil, initFrame = nil, totalDX = 0, totalDY = 0, dirty = false }
 -- Hyper state tracked via flagsChanged so click events don't race with Karabiner-Elements
 -- synthetic modifier delivery. The click event's own flags can arrive before all four
 -- modifier keys are reflected, causing isHyper to return false and the click to fall
@@ -502,59 +502,54 @@ _G.windowDragger = hs.eventtap.new({ EV_DOWN, EV_DRAG, EV_UP, EV_RDOWN, EV_RDRAG
         local dy = event:getProperty(props.scrollWheelEventPointDeltaAxis1)
         if dx == 0 and dy == 0 then return true end
 
-        -- On the first real scroll event: snapshot frame, lock edges, create canvas.
+        -- On the first real scroll event: snapshot frame and lock edges.
         -- Edges are locked so the resize direction can't flip as the window grows/shrinks.
         if not scrollTarget.win then
             local f = win:frame()
             scrollTarget.win       = win
             scrollTarget.edges     = quadrantEdges(pos, f)
             scrollTarget.initFrame = { x = f.x, y = f.y, w = f.w, h = f.h }
-            scrollTarget.canvas    = makeResizeCanvas(f)
             scrollTarget.totalDX   = 0
             scrollTarget.totalDY   = 0
+            scrollTarget.dirty     = false
+            -- 60fps timer flushes accumulated deltas to setFrame independently of the
+            -- event tap. This decouples the tap from slow app redraws (Xcode, Reminders)
+            -- so the event queue never backs up — same principle as setTopLeft for move.
+            scrollTarget.updateTimer = hs.timer.doEvery(1/60, function()
+                if not scrollTarget.dirty then return end
+                scrollTarget.dirty = false
+                local e     = scrollTarget.edges
+                local initF = scrollTarget.initFrame
+                local newX  = initF.x
+                local newY  = initF.y
+                local newW  = initF.w
+                local newH  = initF.h
+                if e.left then
+                    newW = max(MIN_WIN_W, initF.w - scrollTarget.totalDX)
+                    newX = initF.x + initF.w - newW
+                elseif e.right then
+                    newW = max(MIN_WIN_W, initF.w + scrollTarget.totalDX)
+                end
+                if e.top then
+                    newH = max(MIN_WIN_H, initF.h - scrollTarget.totalDY)
+                    newY = initF.y + initF.h - newH
+                elseif e.bottom then
+                    newH = max(MIN_WIN_H, initF.h + scrollTarget.totalDY)
+                end
+                pcall(scrollTarget.win.setFrame, scrollTarget.win, { x = newX, y = newY, w = newW, h = newH })
+            end)
         end
 
-        -- Accumulate total scroll delta from the initial frame (same as drag approach).
-        -- This avoids calling win:frame() on every event, which is the source of lag.
+        -- Accumulate total scroll delta from the initial frame — the timer reads this.
         scrollTarget.totalDX = scrollTarget.totalDX + dx * SCROLL_RESIZE_SPEED
         scrollTarget.totalDY = scrollTarget.totalDY + dy * SCROLL_RESIZE_SPEED
+        scrollTarget.dirty   = true
 
-        local e     = scrollTarget.edges
-        local initF = scrollTarget.initFrame
-        local newX  = initF.x
-        local newY  = initF.y
-        local newW  = initF.w
-        local newH  = initF.h
-
-        if e.left then
-            newW = max(MIN_WIN_W, initF.w - scrollTarget.totalDX)
-            newX = initF.x + initF.w - newW  -- anchor right edge, move left edge
-        elseif e.right then
-            newW = max(MIN_WIN_W, initF.w + scrollTarget.totalDX)
-        end
-
-        if e.top then
-            newH = max(MIN_WIN_H, initF.h - scrollTarget.totalDY)
-            newY = initF.y + initF.h - newH  -- anchor bottom edge, move top edge
-        elseif e.bottom then
-            newH = max(MIN_WIN_H, initF.h + scrollTarget.totalDY)
-        end
-
-        -- Update only the canvas overlay — setFrame is deferred to gesture end.
-        local cf = { x = newX, y = newY, w = newW, h = newH }
-        scrollTarget.canvas:frame(cf)
-        scrollTarget.canvasFrame = cf
-
-        -- Reset the release timer; on expiry commit the frame and clean up.
-        if scrollTarget.timer then scrollTarget.timer:stop() end
-        scrollTarget.timer = hs.timer.doAfter(0.3, function()
-            if scrollTarget.canvas then
-                if scrollTarget.canvasFrame then
-                    pcall(win.setFrame, win, scrollTarget.canvasFrame)
-                end
-                deleteResizeCanvas(scrollTarget.canvas)
-            end
-            scrollTarget = { win = nil, timer = nil, edges = nil, initFrame = nil, canvas = nil, totalDX = 0, totalDY = 0 }
+        -- Reset the release timer; on expiry stop the update timer and clean up.
+        if scrollTarget.releaseTimer then scrollTarget.releaseTimer:stop() end
+        scrollTarget.releaseTimer = hs.timer.doAfter(0.3, function()
+            if scrollTarget.updateTimer then scrollTarget.updateTimer:stop() end
+            scrollTarget = { win = nil, releaseTimer = nil, updateTimer = nil, edges = nil, initFrame = nil, totalDX = 0, totalDY = 0, dirty = false }
         end)
         return true
     end
