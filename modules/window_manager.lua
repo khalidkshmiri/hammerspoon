@@ -17,11 +17,16 @@ local ANIMATE_DURATION = 0.2  -- seconds for maximize / restore transitions (dra
 
 local types   = hs.eventtap.event.types
 local props   = hs.eventtap.event.properties
-local EV_DOWN = types.leftMouseDown
-local EV_DRAG = types.leftMouseDragged
-local EV_UP   = types.leftMouseUp
+local EV_DOWN  = types.leftMouseDown
+local EV_DRAG  = types.leftMouseDragged
+local EV_UP    = types.leftMouseUp
+local EV_RDOWN  = types.rightMouseDown
+local EV_RDRAG  = types.rightMouseDragged
+local EV_RUP    = types.rightMouseUp
+local EV_SCROLL = types.scrollWheel
 local max, min = math.max, math.min
 
+local SCROLL_RESIZE_SPEED   = 2    -- px of resize per px of scroll delta; negate to flip direction
 local RESIZE_MARGIN         = 20   -- px from window edge: Hyper+drag here resizes
 local DOUBLE_CLICK_INTERVAL = 0.35 -- seconds between two Hyper+clicks to count as double-click
 local TITLE_BAR_HEIGHT      = 32   -- px from window top: plain-drag intercept zone
@@ -40,6 +45,9 @@ local MODIFIER = { cmd = true, ctrl = true, alt = true, shift = true }
 local dragState   = {}
 local dragGen     = 0
 local lastClick   = { time = 0, winId = nil }
+-- Scroll gesture target: locked when a scroll starts, released 0.3s after last event.
+-- Prevents losing the window when it shrinks past the cursor mid-gesture.
+local scrollTarget = { win = nil, timer = nil }
 -- Hyper state tracked via flagsChanged so click events don't race with Karabiner-Elements
 -- synthetic modifier delivery. The click event's own flags can arrive before all four
 -- modifier keys are reflected, causing isHyper to return false and the click to fall
@@ -98,6 +106,19 @@ local function resizeEdges(pos, f)
         right  = pos.x >= f.x + f.w - RESIZE_MARGIN,
         top    = pos.y <= f.y + RESIZE_MARGIN,
         bottom = pos.y >= f.y + f.h - RESIZE_MARGIN,
+    }
+end
+
+-- Maps cursor position to the nearest corner of the window using quadrants.
+-- Used for Hyper+right-drag: resize from anywhere, not just the edge zone.
+local function quadrantEdges(pos, f)
+    local cx = f.x + f.w / 2
+    local cy = f.y + f.h / 2
+    return {
+        left   = pos.x < cx,
+        right  = pos.x >= cx,
+        top    = pos.y < cy,
+        bottom = pos.y >= cy,
     }
 end
 
@@ -166,7 +187,7 @@ local function doMaximize(win, winId, currentF)
     win:focus()
 end
 
-_G.windowDragger = hs.eventtap.new({ EV_DOWN, EV_DRAG, EV_UP }, function(event)
+_G.windowDragger = hs.eventtap.new({ EV_DOWN, EV_DRAG, EV_UP, EV_RDOWN, EV_RDRAG, EV_RUP, EV_SCROLL }, function(event)
     local eventType = event:getType()
 
     -- ── Mouse down ───────────────────────────────────────────────────────────
@@ -389,6 +410,126 @@ _G.windowDragger = hs.eventtap.new({ EV_DOWN, EV_DRAG, EV_UP }, function(event)
             dragState = {}
             return true
         end
+
+    -- ── Right mouse down: Hyper+right-drag = resize from nearest corner ───────
+    -- Divides the window into four quadrants; the quadrant the cursor is in
+    -- determines which corner gets dragged. Works from anywhere in the window.
+    elseif eventType == EV_RDOWN then
+        dragState = {}
+        if not isHyper() then return end
+        local pos = event:location()
+        local win = getWindowAtPoint(pos, RESIZE_MARGIN)
+        if not (win and not win:isFullScreen()) then return true end
+
+        local f     = win:frame()
+        local winId = win:id()
+        savedFrames[winId] = nil  -- discard any saved maximize state for this window
+
+        local initF = { x = f.x, y = f.y, w = f.w, h = f.h }
+        dragState = {
+            window       = win,
+            isResize     = true,
+            edges        = quadrantEdges(pos, f),
+            isCmdDrag    = true,
+            didDrag      = false,
+            initMouseX   = pos.x,
+            initMouseY   = pos.y,
+            initFrame    = initF,
+            canvasFrame  = initF,
+            resizeCanvas = makeResizeCanvas(initF),
+        }
+        return true
+
+    -- ── Right mouse drag: update resize canvas ────────────────────────────────
+    elseif eventType == EV_RDRAG then
+        if not dragState.window or not dragState.isResize then return end
+        dragState.didDrag = true
+
+        local curPos  = event:location()
+        local totalDX = curPos.x - dragState.initMouseX
+        local totalDY = curPos.y - dragState.initMouseY
+        local e       = dragState.edges
+        local initF   = dragState.initFrame
+
+        local newX = initF.x
+        local newY = initF.y
+        local newW = initF.w
+        local newH = initF.h
+
+        if e.left then
+            newW = max(MIN_WIN_W, initF.w - totalDX)
+            newX = initF.x + initF.w - newW
+        elseif e.right then
+            newW = max(MIN_WIN_W, initF.w + totalDX)
+        end
+
+        if e.top then
+            newH = max(MIN_WIN_H, initF.h - totalDY)
+            newY = initF.y + initF.h - newH
+        elseif e.bottom then
+            newH = max(MIN_WIN_H, initF.h + totalDY)
+        end
+
+        local cf = { x = newX, y = newY, w = newW, h = newH }
+        dragState.resizeCanvas:frame(cf)
+        dragState.canvasFrame = cf
+        return true
+
+    -- ── Right mouse up: commit canvas frame to window ─────────────────────────
+    elseif eventType == EV_RUP then
+        if dragState.window and dragState.resizeCanvas then
+            if dragState.didDrag then
+                pcall(dragState.window.setFrame, dragState.window, dragState.canvasFrame)
+            end
+            deleteResizeCanvas(dragState.resizeCanvas)
+            dragState = {}
+            return true
+        end
+
+    -- ── Scroll: Hyper + two-finger scroll = resize from nearest corner ────────
+    -- Each scroll event applies directly to the current frame (no canvas needed).
+    -- Quadrant under the cursor determines which corner is being resized.
+    elseif eventType == EV_SCROLL then
+        if not isHyper() then return end
+        local pos = event:location()
+        -- Reuse the locked target if mid-gesture; otherwise find by position.
+        -- The lock prevents losing the window when it shrinks past the cursor.
+        local win = scrollTarget.win or getWindowAtPoint(pos, RESIZE_MARGIN)
+        if not (win and not win:isFullScreen()) then return true end
+        -- Refresh the gesture lock and reset the release timer.
+        scrollTarget.win = win
+        if scrollTarget.timer then scrollTarget.timer:stop() end
+        scrollTarget.timer = hs.timer.doAfter(0.3, function()
+            scrollTarget = { win = nil, timer = nil }
+        end)
+
+        local dx = event:getProperty(props.scrollWheelEventPointDeltaAxis2)
+        local dy = event:getProperty(props.scrollWheelEventPointDeltaAxis1)
+        if dx == 0 and dy == 0 then return true end
+
+        local f = win:frame()
+        local e = quadrantEdges(pos, f)
+        local newX = f.x
+        local newY = f.y
+        local newW = f.w
+        local newH = f.h
+
+        if e.left then
+            newW = max(MIN_WIN_W, f.w - dx * SCROLL_RESIZE_SPEED)
+            newX = f.x + f.w - newW  -- anchor right edge, move left edge
+        elseif e.right then
+            newW = max(MIN_WIN_W, f.w + dx * SCROLL_RESIZE_SPEED)
+        end
+
+        if e.top then
+            newH = max(MIN_WIN_H, f.h - dy * SCROLL_RESIZE_SPEED)
+            newY = f.y + f.h - newH  -- anchor bottom edge, move top edge
+        elseif e.bottom then
+            newH = max(MIN_WIN_H, f.h + dy * SCROLL_RESIZE_SPEED)
+        end
+
+        pcall(win.setFrame, win, { x = newX, y = newY, w = newW, h = newH })
+        return true
     end
 end)
 
