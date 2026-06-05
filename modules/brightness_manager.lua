@@ -42,12 +42,20 @@ end
 
 local function setBrightness(name, brightness)
     local brightnessStr = string.format("%.1f", brightness)
+    -- Snapshot built-in brightness before running BetterDisplay — it can
+    -- inadvertently change the internal display as a side effect.
+    local builtinBefore = hs.brightness.get()
     pendingBrightness = true
     hs.task.new(BETTERDISPLAY, function(code, stdout, stderr)
         pendingBrightness = false
         if code == 0 then
             lastSet.brightness = brightness
             lastSet.period = currentPeriod()
+            -- Restore built-in brightness if BetterDisplay touched it.
+            local builtinAfter = hs.brightness.get()
+            if builtinAfter ~= builtinBefore then
+                hs.brightness.set(builtinBefore)
+            end
         else
             hs.alert.show("Brightness error: " .. (stderr ~= "" and stderr or stdout))
         end
