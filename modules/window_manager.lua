@@ -240,7 +240,7 @@ _G.windowDragger = hs.eventtap.new({ EV_DOWN, EV_DRAG, EV_UP, EV_RDOWN, EV_RDRAG
         if inResizeZone(pos, f) then
             savedFrames[winId] = nil
             local initF = { x = f.x, y = f.y, w = f.w, h = f.h }
-            dragState = {
+            local ds = {
                 window       = win,
                 isResize     = true,
                 edges        = resizeEdges(pos, f),
@@ -249,9 +249,36 @@ _G.windowDragger = hs.eventtap.new({ EV_DOWN, EV_DRAG, EV_UP, EV_RDOWN, EV_RDRAG
                 initMouseX   = pos.x,
                 initMouseY   = pos.y,
                 initFrame    = initF,
-                canvasFrame  = initF,
-                resizeCanvas = makeResizeCanvas(initF),
+                totalDX      = 0,
+                totalDY      = 0,
+                dirty        = false,
             }
+            -- 60fps timer flushes accumulated deltas to setFrame, same as scroll resize.
+            -- Keeps drag smooth even when the target app is slow to respond to AX calls.
+            ds.resizeTimer = hs.timer.doEvery(1/60, function()
+                if not ds.dirty then return end
+                ds.dirty = false
+                local e     = ds.edges
+                local initF = ds.initFrame
+                local newX  = initF.x
+                local newY  = initF.y
+                local newW  = initF.w
+                local newH  = initF.h
+                if e.left then
+                    newW = max(MIN_WIN_W, initF.w - ds.totalDX)
+                    newX = initF.x + initF.w - newW
+                elseif e.right then
+                    newW = max(MIN_WIN_W, initF.w + ds.totalDX)
+                end
+                if e.top then
+                    newH = max(MIN_WIN_H, initF.h - ds.totalDY)
+                    newY = initF.y + initF.h - newH
+                elseif e.bottom then
+                    newH = max(MIN_WIN_H, initF.h + ds.totalDY)
+                end
+                pcall(ds.window.setFrame, ds.window, { x = newX, y = newY, w = newW, h = newH })
+            end)
+            dragState = ds
             return true
         end
 
@@ -297,37 +324,13 @@ _G.windowDragger = hs.eventtap.new({ EV_DOWN, EV_DRAG, EV_UP, EV_RDOWN, EV_RDRAG
         local dy = event:getProperty(props.mouseEventDeltaY)
 
         -- ── Resize mode ──────────────────────────────────────────────────────
-        -- Only move the canvas overlay — no AX calls on the actual window.
-        -- The window is resized once on mouse-up to keep drag perfectly smooth.
+        -- Accumulate total mouse offset from the initial position; the 60fps
+        -- timer reads these and calls setFrame, decoupling the tap from slow apps.
         if dragState.isResize then
-            local curPos  = event:location()
-            local totalDX = curPos.x - dragState.initMouseX
-            local totalDY = curPos.y - dragState.initMouseY
-            local e       = dragState.edges
-            local initF   = dragState.initFrame
-
-            local newX = initF.x
-            local newY = initF.y
-            local newW = initF.w
-            local newH = initF.h
-
-            if e.left then
-                newW = max(MIN_WIN_W, initF.w - totalDX)
-                newX = initF.x + initF.w - newW  -- anchor right edge
-            elseif e.right then
-                newW = max(MIN_WIN_W, initF.w + totalDX)
-            end
-
-            if e.top then
-                newH = max(MIN_WIN_H, initF.h - totalDY)
-                newY = initF.y + initF.h - newH  -- anchor bottom edge
-            elseif e.bottom then
-                newH = max(MIN_WIN_H, initF.h + totalDY)
-            end
-
-            local cf = { x = newX, y = newY, w = newW, h = newH }
-            dragState.resizeCanvas:frame(cf)
-            dragState.canvasFrame = cf
+            local curPos = event:location()
+            dragState.totalDX = curPos.x - dragState.initMouseX
+            dragState.totalDY = curPos.y - dragState.initMouseY
+            dragState.dirty   = true
             return true
         end
 
@@ -392,14 +395,30 @@ _G.windowDragger = hs.eventtap.new({ EV_DOWN, EV_DRAG, EV_UP, EV_RDOWN, EV_RDRAG
     -- ── Mouse up ─────────────────────────────────────────────────────────────
     elseif eventType == EV_UP then
         if dragState.window then
-            if dragState.resizeCanvas then
-                -- Commit the canvas frame to the actual window in one atomic AX call.
-                -- Using setFrame (vs separate setTopLeft + setSize) avoids a race where
-                -- some apps snap back between the two calls.
-                if dragState.didDrag then
-                    pcall(dragState.window.setFrame, dragState.window, dragState.canvasFrame)
+            if dragState.resizeTimer then
+                -- Flush any last pending delta before stopping the timer.
+                if dragState.dirty then
+                    local e     = dragState.edges
+                    local initF = dragState.initFrame
+                    local newX  = initF.x
+                    local newY  = initF.y
+                    local newW  = initF.w
+                    local newH  = initF.h
+                    if e.left then
+                        newW = max(MIN_WIN_W, initF.w - dragState.totalDX)
+                        newX = initF.x + initF.w - newW
+                    elseif e.right then
+                        newW = max(MIN_WIN_W, initF.w + dragState.totalDX)
+                    end
+                    if e.top then
+                        newH = max(MIN_WIN_H, initF.h - dragState.totalDY)
+                        newY = initF.y + initF.h - newH
+                    elseif e.bottom then
+                        newH = max(MIN_WIN_H, initF.h + dragState.totalDY)
+                    end
+                    pcall(dragState.window.setFrame, dragState.window, { x = newX, y = newY, w = newW, h = newH })
                 end
-                deleteResizeCanvas(dragState.resizeCanvas)
+                dragState.resizeTimer:stop()
             end
             if dragState.isCmdDrag then
                 if not dragState.didDrag then
