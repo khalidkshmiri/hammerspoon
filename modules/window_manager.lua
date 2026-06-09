@@ -161,6 +161,13 @@ _G.windowDragger = hs.eventtap.new({ EV_DOWN, EV_DRAG, EV_UP, EV_RDOWN, EV_RDRAG
     if eventType == EV_DOWN then
         dragState = {}
         local hasHyper = isHyper()
+        -- Fallback for the race after a space switch: macOS emits flagsChanged during the
+        -- transition which resets hyperActive to false, but the event's own flags still
+        -- reflect the actual held modifiers. The two checks cover complementary failure modes.
+        if not hasHyper then
+            local ef = event:getFlags()
+            hasHyper = (ef.cmd and ef.ctrl and ef.alt and ef.shift) == true
+        end
         local pos      = event:location()
 
         -- Fast path: skip the expensive window lookup when nothing to intercept
