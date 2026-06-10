@@ -21,5 +21,6 @@ end
 
 load("modules.window_manager")
 load("modules.brightness_manager")
+load("modules.builtin_brightness_manager")
 
 hs.alert.show("Config loaded")
