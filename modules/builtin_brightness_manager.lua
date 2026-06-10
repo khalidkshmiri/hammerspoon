@@ -27,7 +27,7 @@ end
 resetIfNewDay()
 
 -- Daily reset at midnight.
-_G.builtinBrightnessMidnightTimer = hs.timer.doAt("00:00", "24h", function()
+_G.builtinBrightnessMidnightTimer = hs.timer.doAt("00:00", "1d", function()
     hs.brightness.set(DEFAULT_BRIGHTNESS)
     hs.settings.set(SETTINGS_KEY, today())
 end)
