@@ -91,6 +91,9 @@ local function getWindowAtPoint(pos, buffer)
 end
 
 local function inResizeZone(pos, f)
+    -- Guard against degenerate frames (e.g. w/h near 0) reported by AX right after a
+    -- space switch, before which the "right/bottom edge" math would be true everywhere.
+    if f.w <= 2 * RESIZE_MARGIN or f.h <= 2 * RESIZE_MARGIN then return false end
     return pos.x <= f.x + RESIZE_MARGIN or pos.x >= f.x + f.w - RESIZE_MARGIN or
            pos.y <= f.y + RESIZE_MARGIN or pos.y >= f.y + f.h - RESIZE_MARGIN
 end
