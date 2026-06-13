@@ -33,6 +33,5 @@ load("modules.menubar_quit")
 load("modules.clipboard_ring")
 load("modules.horizontal_scroll")
 load("modules.app_rules")
-load("modules.focus_modes")
 
 hs.alert.show("Config loaded")
