@@ -13,6 +13,11 @@ _G.configWatcher = hs.pathwatcher.new(hs.configdir, function(files)
     _G.reloadTimer = hs.timer.doAfter(0.3, hs.reload)
 end):start()
 
+-- ── Command-line interface ────────────────────────────────────────────────────
+-- Registers the IPC message port so the `hs` CLI (symlinked in /opt/homebrew/bin)
+-- can send Lua to this running instance.
+require("hs.ipc")
+
 -- ── Modules ───────────────────────────────────────────────────────────────────
 local function load(mod)
     local ok, err = pcall(require, mod)
@@ -23,5 +28,6 @@ load("modules.window_manager")
 load("modules.brightness_manager")
 load("modules.builtin_brightness_manager")
 load("modules.paste_manager")
+load("modules.dock_quit")
 
 hs.alert.show("Config loaded")
