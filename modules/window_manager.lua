@@ -172,9 +172,14 @@ _G.windowDragger = hs.eventtap.new({ EV_DOWN, EV_DRAG, EV_UP, EV_RDOWN, EV_RDRAG
             hasHyper = (ef.cmd and ef.ctrl and ef.alt and ef.shift) == true
         end
         local pos      = event:location()
+        -- 2 = the second click of a native double-click. Used below to give plain
+        -- title-bar double-clicks the same maximize/restore as Hyper+double-click.
+        local clickState = event:getProperty(props.mouseEventClickState)
 
-        -- Fast path: skip the expensive window lookup when nothing to intercept
-        if not hasHyper and next(savedFrames) == nil then return end
+        -- Fast path: skip the expensive window lookup when nothing to intercept.
+        -- A plain double-click is the one no-Hyper case worth the lookup even with
+        -- no saved frames (it may be a fresh window to maximize).
+        if not hasHyper and next(savedFrames) == nil and clickState ~= 2 then return end
 
         local win = getWindowAtPoint(pos, hasHyper and RESIZE_MARGIN or 0)
 
@@ -188,6 +193,25 @@ _G.windowDragger = hs.eventtap.new({ EV_DOWN, EV_DRAG, EV_UP, EV_RDOWN, EV_RDRAG
 
         -- ── Plain (no Hyper): intercept title-bar drags on windows we maximized ──
         if not hasHyper then
+            -- Native double-click on the title bar → same maximize/restore as
+            -- Hyper+double-click, replacing macOS' default zoom/minimize. Applies to
+            -- any window, not just ones we previously maximized.
+            local inTitleZone = pos.y >= f.y
+                            and pos.y <= f.y + TITLE_BAR_HEIGHT
+                            and pos.x >  f.x + WINDOW_CONTROLS_WIDTH
+                            and pos.x <  f.x + f.w - RESIZE_MARGIN
+            if clickState == 2 and inTitleZone then
+                lastClick = { time = 0, winId = nil }
+                if isStillMaximized(winId, f) then
+                    local pre = savedFrames[winId].pre
+                    savedFrames[winId] = nil
+                    withAnimation(function() win:setFrame(pre) end)
+                else
+                    doMaximize(win, winId, f)
+                end
+                return true
+            end
+
             local inTitleBar = savedFrames[winId]
                            and isStillMaximized(winId, f)
                            and pos.y >= f.y
