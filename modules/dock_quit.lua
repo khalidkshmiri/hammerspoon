@@ -69,7 +69,6 @@ _G.dockQuitTap = eventtap.new({ types.otherMouseDown }, function(e)
     if not app then return false end
 
     app:kill() -- graceful terminate, equivalent to ⌘Q
-    hs.alert.show("Quit " .. (item.AXTitle or app:name() or "app"))
 
     return true -- swallow only the clicks we actually handle
 end)

@@ -58,7 +58,6 @@ _G.menubarQuitTap = eventtap.new({ types.otherMouseDown }, function(e)
 
     local name = app:name()
     app:kill() -- graceful terminate, equivalent to ⌘Q
-    hs.alert.show("Quit " .. (name or "app"))
 
     return true -- swallow only the clicks we actually handle
 end)
