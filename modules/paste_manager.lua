@@ -64,7 +64,15 @@ _G.pasteManagerTap = eventtap.new({ types.keyDown }, function(e)
     if not f.cmd or f.ctrl or f.shift then return false end
 
     if f.alt then
-        -- Cmd+Opt+V → formatted paste. Swallow original, re-issue a clean native paste.
+        -- Finder uses Cmd+Opt+V to *move* (cut-paste) files/folders.
+        -- Pass the event through untouched so the move actually happens.
+        local frontApp = hs.application.frontmostApplication()
+        if frontApp and frontApp:bundleID() == "com.apple.finder" then
+            return false
+        end
+        -- All other apps: Cmd+Opt+V → formatted paste. Swallow original and
+        -- re-issue a clean native paste (Option stripped so it doesn't trigger
+        -- app-specific Opt+V shortcuts in editors, etc.).
         -- Clipboard is never touched, so files/images/rich text all paste as-is.
         postTaggedPaste()
         return true
