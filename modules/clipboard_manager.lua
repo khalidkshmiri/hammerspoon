@@ -31,6 +31,7 @@ package.loaded["modules.clipboard_manager"] = nil
 -- Reload safety: tear down everything the previous load created.
 if _G.clipboardMgrTimer    then _G.clipboardMgrTimer:stop()     end
 if _G.clipboardMgrTap      then _G.clipboardMgrTap:stop()        end
+if _G.clipboardMgrMouseTap then _G.clipboardMgrMouseTap:stop()   end
 if _G.clipboardMgrWebview  then _G.clipboardMgrWebview:delete()  end
 if _G.clipboardMgrHotkey   then _G.clipboardMgrHotkey:delete()   end
 
@@ -620,6 +621,7 @@ _G.clipboardMgrWebview = hs.webview.new(rect, { developerExtrasEnabled = false }
 local function closePanel()
     _G.clipboardMgrOpen = false
     if _G.clipboardMgrTap then _G.clipboardMgrTap:stop() end
+    if _G.clipboardMgrMouseTap then _G.clipboardMgrMouseTap:stop() end
     if _G.clipboardMgrWebview then _G.clipboardMgrWebview:hide() end
 end
 
@@ -637,7 +639,22 @@ local function showPanel()
     _G.clipboardMgrWebview:show():bringToFront(true)
     _G.clipboardMgrOpen = true
     if _G.clipboardMgrTap then _G.clipboardMgrTap:start() end
+    if _G.clipboardMgrMouseTap then _G.clipboardMgrMouseTap:start() end
 end
+
+-- Click outside the panel dismisses it. A click inside is passed through (return
+-- false) so the webview still receives it (e.g. clicking a row to paste).
+_G.clipboardMgrMouseTap = eventtap.new(
+    { eventtap.event.types.leftMouseDown, eventtap.event.types.rightMouseDown },
+    function(e)
+        local f = _G.clipboardMgrWebview:frame()
+        local p = e:location()
+        local inside = p.x >= f.x and p.x <= f.x + f.w
+                   and p.y >= f.y and p.y <= f.y + f.h
+        if inside then return false end
+        closePanel()
+        return true -- swallow the dismissing click so it doesn't also hit the app behind
+    end)
 
 -- ── Keyboard (global eventtap, live only while the panel is open) ──────────────
 -- Borderless webviews can't take key focus, so we own the keyboard here. Every
