@@ -651,6 +651,11 @@ local function moveSel(delta)
 end
 
 _G.clipboardMgrTap = eventtap.new({ eventtap.event.types.keyDown }, function(e)
+    -- Let our own synthetic paste (tagged MAGIC) pass straight through. For
+    -- keep-open pastes (number keys, ⌘↩) the panel stays up, so this tap is still
+    -- live when postPaste fires its Cmd+V — without this guard the tap would
+    -- swallow that Cmd+V and nothing would actually paste.
+    if e:getProperty(props.eventSourceUserData) == MAGIC then return false end
     local ok, err = pcall(function()
         local code = e:getKeyCode()
         local f    = e:getFlags()
