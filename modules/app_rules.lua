@@ -140,11 +140,14 @@ end
 -- ── Auto-restore on launch ─────────────────────────────────────────────────────
 -- A just-launched app usually has no window yet, so poll briefly until its primary
 -- window exists, then restore once. ~10 tries × 0.3s ≈ 3s budget before giving up.
+-- The layout is read once up front (we're only ever waiting on the window, never on
+-- the layout), so a burst of launches doesn't re-read settings on every poll tick.
 local function restoreAppWhenReady(entry)
+    local layout = currentLayout()
+    if not layout or not layout[entry.id] then return end  -- nothing saved for this app/setup
     local attempts = 0
     local function tryRestore()
         attempts = attempts + 1
-        local layout = currentLayout()
         if restoreApp(entry, layout) then return end       -- done
         if attempts < 10 then hs.timer.doAfter(0.3, tryRestore) end
     end
