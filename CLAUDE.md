@@ -17,7 +17,9 @@ mouse-driven window management plus a set of keyboard/input/automation shortcuts
   - `window_manager.lua` — Hyper + drag to move/resize a window; Hyper + double-click
     to toggle maximize/restore. The core feature (see README).
   - `app_rules.lua` — auto-restores a saved app layout into a persistent desktop
-    Space when those apps launch. Capture the current layout with `hs -c "captureLayout()"`.
+    Space when those apps launch. Layouts are keyed by a signature of the attached
+    screens (MacBook-alone vs docked are separate), so capture once per setup with
+    `hs -c "captureLayout()"`; restore picks the matching layout automatically.
   - `paste_manager.lua` — Cmd+V pastes WITHOUT formatting (strips rich text);
     Cmd+Opt+V keeps formatting. Files/images pass through unchanged.
   - `clipboard_manager.lua` — Hyper+V toggles a native-style, keyboard-driven
