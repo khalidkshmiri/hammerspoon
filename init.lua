@@ -30,7 +30,7 @@ load("modules.builtin_brightness_manager")
 load("modules.paste_manager")
 load("modules.dock_quit")
 load("modules.menubar_quit")
-load("modules.clipboard_ring")
+load("modules.clipboard_manager")
 load("modules.horizontal_scroll")
 load("modules.app_rules")
 
