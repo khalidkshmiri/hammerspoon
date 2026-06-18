@@ -19,7 +19,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   thumbnails) and persists across reboots. Bindings: ↩ paste into the active window ·
   ⌘↩ paste & keep the panel open · ⌘C copy for manual paste · ⌘Y Quick Look ·
   ⌘S save to Desktop · ⌘R show in Finder · ⌘⇧S share · ⌘⌫ delete · ⌘⇧⌫ clear all ·
-  type to search · `?` controls overlay · esc to close.
+  type to search · `?` controls overlay · esc or a click outside the panel to close.
 - Numbered quick-paste: the panel numbers the first 10 rows (1–9, 0); pressing a digit
   pastes that item into the active window and keeps the panel open, without changing
   history order — so you can fire off several clips in sequence.
