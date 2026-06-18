@@ -18,9 +18,19 @@ package.loaded["modules.clipboard_manager"] = nil
 -- also tag the clipboard write transient/concealed so our own poll (and other
 -- history managers) never re-record it; image/file writes can't carry those
 -- markers, so a one-shot ignore guard skips the single change they cause.
+--
+-- Keyboard model (why an eventtap, not the webview's own key handling): the panel
+-- is a borderless hs.webview, and a borderless NSWindow can't become the key
+-- window — so its <input> never gets keyboard focus until the user clicks it
+-- (that was issue #11: Esc did nothing until you clicked first). Instead of
+-- fighting NSWindow, we own the keyboard with a global hs.eventtap that's live
+-- only while the panel is showing: it fires regardless of which window is key, so
+-- Esc/arrows/actions work the instant the panel opens. Lua holds the search query
+-- and selection; the webview is a pure renderer driven by setState() calls.
 
 -- Reload safety: tear down everything the previous load created.
 if _G.clipboardMgrTimer    then _G.clipboardMgrTimer:stop()     end
+if _G.clipboardMgrTap      then _G.clipboardMgrTap:stop()        end
 if _G.clipboardMgrWebview  then _G.clipboardMgrWebview:delete()  end
 if _G.clipboardMgrHotkey   then _G.clipboardMgrHotkey:delete()   end
 
@@ -135,6 +145,9 @@ end
 
 local function basename(p) return p:match("([^/]+)/?$") or p end
 
+-- Shell-quote a single argument safely (paths may contain spaces/quotes).
+local function shq(s) return "'" .. tostring(s):gsub("'", "'\\''") .. "'" end
+
 -- ── Capture & classify ────────────────────────────────────────────────────────
 local function shouldSkip()
     for _, uti in ipairs(pb.contentTypes() or {}) do
@@ -246,7 +259,44 @@ _G.clipboardMgrTimer = hs.timer.doEvery(POLL, function()
     if item then pushItem(item) end
 end):start()
 
--- ── Re-paste ──────────────────────────────────────────────────────────────────
+local function findById(id)
+    for _, it in ipairs(history) do if it.id == id then return it end end
+end
+
+-- ── Clipboard staging / re-paste ──────────────────────────────────────────────
+-- Stage an item onto the system clipboard. `manual=true` writes a *real* clip the
+-- user will paste themselves (no transient markers, no MAGIC) — issue #9's
+-- copy-for-manual-paste. Otherwise it stages for our own synthetic paste, tagging
+-- text/rich transient so our poll never re-records it.
+local function stageClipboard(item, manual)
+    if item.kind == "text" or item.kind == "url" then
+        if manual then
+            pb.setContents(item.text)
+        else
+            pb.writeAllData({ [PLAIN_UTI] = item.text, [CONCEALED] = "", [TRANSIENT] = "" })
+        end
+
+    elseif item.kind == "rich" then
+        local snap = loadRichSnapshot(item)
+        if not manual then snap[CONCEALED] = ""; snap[TRANSIENT] = "" end
+        pb.writeAllData(snap)
+
+    elseif item.kind == "image" then
+        local img = hs.image.imageFromPath(blobPath(item.imageFile))
+        if not img then return false end
+        _G.clipboardMgrIgnore = true -- writeObjects can't carry the skip markers
+        pb.writeObjects(img)
+
+    elseif item.kind == "file" then
+        local objs = {}
+        for _, u in ipairs(item.urls or {}) do objs[#objs + 1] = { url = u } end
+        if #objs == 0 then return false end
+        _G.clipboardMgrIgnore = true
+        pb.writeObjects(objs)
+    end
+    return true
+end
+
 -- Tagged with MAGIC so paste_manager's tap passes it straight through (no strip).
 local function postPaste()
     local down = eventtap.event.newKeyEvent({ "cmd" }, "v", true)
@@ -257,156 +307,88 @@ local function postPaste()
     up:post()
 end
 
-local function findById(id)
-    for _, it in ipairs(history) do if it.id == id then return it end end
-end
-
+-- Re-activate the app that was front when the panel opened, then paste into it.
 local function repaste(item)
-    if item.kind == "text" or item.kind == "url" then
-        pb.writeAllData({ [PLAIN_UTI] = item.text, [CONCEALED] = "", [TRANSIENT] = "" })
-
-    elseif item.kind == "rich" then
-        local snap = loadRichSnapshot(item)
-        snap[CONCEALED] = ""
-        snap[TRANSIENT] = ""
-        pb.writeAllData(snap)
-
-    elseif item.kind == "image" then
-        local img = hs.image.imageFromPath(blobPath(item.imageFile))
-        if not img then return end
-        _G.clipboardMgrIgnore = true -- writeObjects can't carry the skip markers
-        pb.writeObjects(img)
-
-    elseif item.kind == "file" then
-        local objs = {}
-        for _, u in ipairs(item.urls or {}) do objs[#objs + 1] = { url = u } end
-        if #objs == 0 then return end
-        _G.clipboardMgrIgnore = true
-        pb.writeObjects(objs)
-    end
-
-    -- Re-activate the app that was front when the panel opened, then paste into it.
+    if not stageClipboard(item, false) then return end
     local target = _G.clipboardMgrTargetApp
     if target then target:activate() end
     hs.timer.doAfter(0.08, postPaste)
 end
 
--- ── Panel (hs.webview) ────────────────────────────────────────────────────────
--- usercontent bridges JS → Lua: the panel posts {action,id} when the user picks or
--- dismisses. Created once per load; torn down on the next reload via :delete() above.
-local userContent = hs.webview.usercontent.new("clipMgr")
-userContent:setCallback(function(msg)
-    -- HS bindings have posted either the raw body or a {body=...} wrapper across
-    -- versions — accept both.
-    local m = (type(msg) == "table" and msg.body) and msg.body or msg
-    if type(m) ~= "table" then return end
-    if _G.clipboardMgrWebview then _G.clipboardMgrWebview:hide() end
-    if m.action == "paste" then
-        local item = findById(tonumber(m.id))
-        if item then repaste(item) end
-    end
-end)
+-- ── Per-item side actions (issue #10) ─────────────────────────────────────────
+local DESKTOP = (os.getenv("HOME") or "~") .. "/Desktop"
 
-local screen = hs.screen.mainScreen():frame()
-local W, H = 720, 480
-local rect = {
-    x = screen.x + (screen.w - W) / 2,
-    y = screen.y + (screen.h - H) / 3,
-    w = W, h = H,
-}
-
-_G.clipboardMgrWebview = hs.webview.new(rect, { developerExtrasEnabled = false }, userContent)
-    :windowStyle({ "borderless" })
-    :allowTextEntry(true)            -- required so the search <input> receives typing
-    :transparent(true)              -- let the CSS rounded panel show through
-    :level(hs.drawing.windowLevels.modalPanel)
-    :closeOnEscape(true)
-    :deleteOnClose(false)
-
--- HTML shell is rebuilt with the current rows each show, so the JS sees the data at
--- parse time (no async render() race). textContent (not innerHTML) is used for all
--- clip text, so a clip can never inject markup.
-local function panelHTML(rowsJSON)
-    return [[<!DOCTYPE html><html><head><meta charset="utf-8"><style>
-* { margin:0; padding:0; box-sizing:border-box; }
-html,body { background:transparent; }
-body { font:13px -apple-system,system-ui,sans-serif; color:#fff; padding:18px;
-       -webkit-user-select:none; cursor:default; }
-#panel { background:rgba(30,30,32,0.86); -webkit-backdrop-filter:blur(24px);
-         border:0.5px solid rgba(255,255,255,0.14); border-radius:13px;
-         box-shadow:0 18px 50px rgba(0,0,0,0.55); overflow:hidden;
-         height:calc(100vh - 36px); display:flex; flex-direction:column; }
-#q { width:100%; border:none; outline:none; background:transparent; color:#fff;
-     font-size:16px; padding:14px 18px; border-bottom:0.5px solid rgba(255,255,255,0.10); }
-#q::placeholder { color:rgba(235,235,245,0.4); }
-#list { flex:1; overflow-y:auto; padding:6px; }
-#list::-webkit-scrollbar { width:0; }
-.item { display:flex; align-items:center; gap:10px; padding:9px 12px;
-        border-radius:8px; }
-.item.sel { background:rgba(10,132,255,0.85); }
-.badge { flex:0 0 auto; font-size:10px; font-weight:600; letter-spacing:0.3px;
-         text-transform:uppercase; padding:2px 6px; border-radius:5px;
-         background:rgba(255,255,255,0.14); color:rgba(255,255,255,0.85); }
-.item.sel .badge { background:rgba(255,255,255,0.25); color:#fff; }
-.txt { flex:1; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
-.thumb { flex:0 0 auto; height:34px; max-width:90px; border-radius:4px;
-         object-fit:cover; background:rgba(255,255,255,0.08); }
-#empty { color:rgba(235,235,245,0.4); text-align:center; padding:40px; }
-</style></head><body><div id="panel">
-<input id="q" placeholder="Clipboard history" autofocus autocomplete="off">
-<div id="list"></div></div>
-<script>
-const ITEMS = ]] .. rowsJSON .. [[;
-const KIND = { text:"text", rich:"rich", image:"image", file:"file", url:"url" };
-const q = document.getElementById('q'), listEl = document.getElementById('list');
-let visible = [], sel = 0;
-
-function draw() {
-  listEl.innerHTML = '';
-  if (visible.length === 0) {
-    const e = document.createElement('div'); e.id='empty';
-    e.textContent = ITEMS.length ? 'No matches' : 'No clipboard history yet';
-    listEl.appendChild(e); return;
-  }
-  visible.forEach((it, i) => {
-    const row = document.createElement('div');
-    row.className = 'item' + (i === sel ? ' sel' : '');
-    const b = document.createElement('span'); b.className='badge';
-    b.textContent = KIND[it.kind] || it.kind; row.appendChild(b);
-    const t = document.createElement('span'); t.className='txt';
-    t.textContent = it.preview; row.appendChild(t);
-    if (it.thumb) { const im = document.createElement('img');
-      im.className='thumb'; im.src = it.thumb; row.appendChild(im); }
-    row.addEventListener('click', () => choose(it.id));
-    listEl.appendChild(row);
-  });
-  const cur = listEl.children[sel];
-  if (cur && cur.scrollIntoView) cur.scrollIntoView({ block:'nearest' });
-}
-
-function filter() {
-  const term = q.value.toLowerCase();
-  visible = ITEMS.filter(it => !term || it.preview.toLowerCase().includes(term));
-  sel = 0; draw();
-}
-
-function post(o) { window.webkit.messageHandlers.clipMgr.postMessage(o); }
-function choose(id) { post({ action:'paste', id:id }); }
-
-document.addEventListener('keydown', e => {
-  if (e.key === 'ArrowDown') { sel = Math.min(sel+1, visible.length-1); draw(); e.preventDefault(); }
-  else if (e.key === 'ArrowUp') { sel = Math.max(sel-1, 0); draw(); e.preventDefault(); }
-  else if (e.key === 'Enter') { if (visible[sel]) choose(visible[sel].id); e.preventDefault(); }
-  else if (e.key === 'Escape') { post({ action:'close' }); e.preventDefault(); }
-});
-q.addEventListener('input', filter);
-window.addEventListener('load', () => { q.focus(); filter(); });
-filter();
-</script></body></html>]]
+-- Backing file for Quick Look / reveal / save; for non-file kinds we materialise
+-- the text to a scratch file so those actions still have something to point at.
+local function backingPath(item)
+    if item.kind == "image" then return blobPath(item.imageFile) end
+    if item.kind == "file"  then return (item.paths or {})[1] end
+    local p = blobPath("preview-" .. item.id .. ".txt")
+    local fh = io.open(p, "w")
+    if fh then fh:write(item.text or item.preview or ""); fh:close() end
+    return p
 end
 
--- Build the lightweight rows the panel needs (no heavy blobs except image thumbs,
--- which are rebuilt lazily and cached on the item so reloads stay cheap).
+local function quickLook(item)
+    local p = backingPath(item)
+    if p then hs.execute("qlmanage -p " .. shq(p) .. " >/dev/null 2>&1 &") end
+end
+
+local function revealInFinder(item)
+    local p
+    if item.kind == "file"  then p = (item.paths or {})[1] end
+    if item.kind == "image" then p = blobPath(item.imageFile) end
+    if p then hs.execute("open -R " .. shq(p))
+    else hs.alert.show("No file to reveal", 0.8) end
+end
+
+local function saveToDesktop(item)
+    if item.kind == "image" then
+        hs.execute("cp " .. shq(blobPath(item.imageFile)) .. " " .. shq(DESKTOP .. "/clip-" .. item.id .. ".png"))
+    elseif item.kind == "file" then
+        for _, p in ipairs(item.paths or {}) do hs.execute("cp -R " .. shq(p) .. " " .. shq(DESKTOP) .. "/") end
+    else
+        local fh = io.open(DESKTOP .. "/clip-" .. item.id .. ".txt", "w")
+        if fh then fh:write(item.text or item.preview or ""); fh:close() end
+    end
+    hs.alert.show("Saved to Desktop", 0.8)
+end
+
+-- macOS share sheet via NSSharingServicePicker (no CLI exists for this; AppleScript
+-- pops the picker anchored to the frontmost app). Shares the backing file/URL.
+local function shareItem(item)
+    local p = (item.kind == "url") and item.text or backingPath(item)
+    if not p then return end
+    -- Best-effort: open the share sheet by routing through Finder for file-backed
+    -- items; text/url fall back to copying for the user to share manually.
+    if item.kind == "file" or item.kind == "image" then
+        hs.execute("open -R " .. shq(p)) -- reveal, then user invokes Share from Finder
+        hs.alert.show("Revealed — use Finder ▸ Share", 1.0)
+    else
+        pb.setContents(p)
+        hs.alert.show("Copied — paste to share", 1.0)
+    end
+end
+
+local function deleteItem(id)
+    for i, v in ipairs(history) do
+        if v.id == id then removeBlobs(v); table.remove(history, i); break end
+    end
+    saveHistory()
+end
+
+local function clearAll()
+    for _, it in ipairs(history) do removeBlobs(it) end
+    for i = #history, 1, -1 do table.remove(history, i) end -- empty in place; keep the upvalue
+    saveHistory()
+end
+
+-- ── Panel (hs.webview) ────────────────────────────────────────────────────────
+-- Lua owns the query + selection; the webview is a renderer driven by setState().
+-- usercontent bridges JS → Lua only for mouse clicks (keyboard goes through the
+-- eventtap below).
+local panel = { rows = {}, visible = {}, sel = 1, query = "", help = false }
+
 local function buildRows()
     local rows = {}
     for _, it in ipairs(history) do
@@ -420,24 +402,327 @@ local function buildRows()
     return rows
 end
 
+local function rowById(id)
+    for _, r in ipairs(panel.rows) do if r.id == id then return r end end
+end
+
+-- Recompute the filtered id list and clamp the selection.
+local function refilter()
+    local q = panel.query:lower()
+    panel.visible = {}
+    for _, r in ipairs(panel.rows) do
+        if q == "" or r.preview:lower():find(q, 1, true) then
+            panel.visible[#panel.visible + 1] = r.id
+        end
+    end
+    if panel.sel > #panel.visible then panel.sel = #panel.visible end
+    if panel.sel < 1 then panel.sel = 1 end
+end
+
+-- JSON-encode a bare string (hs.json.encode only handles tables).
+local function jsStr(s)
+    return '"' .. s:gsub('[%c\\"]', function(c)
+        local map = { ['\\'] = '\\\\', ['"'] = '\\"', ['\n'] = '\\n',
+                      ['\r'] = '\\r', ['\t'] = '\\t' }
+        return map[c] or string.format('\\u%04x', c:byte())
+    end) .. '"'
+end
+
+local function pushState()
+    if not _G.clipboardMgrWebview then return end
+    -- An empty Lua table json-encodes as "{}" (object); force "[]" so JS sees an array.
+    local ids = (#panel.visible > 0 and hs.json.encode(panel.visible)) or "[]"
+    _G.clipboardMgrWebview:evaluateJavaScript(
+        string.format("setState(%s,%d,%s,%s)", ids, panel.sel - 1, jsStr(panel.query), tostring(panel.help)))
+end
+
+-- Reload the renderer's full item map (after a structural change: delete/clear),
+-- then push the filtered view.
+local function reloadRows()
+    panel.rows = buildRows()
+    refilter()
+    if _G.clipboardMgrWebview then
+        local json = ((#panel.rows > 0 and hs.json.encode(panel.rows)) or "[]"):gsub("</", "<\\/")
+        _G.clipboardMgrWebview:evaluateJavaScript("loadItems(" .. json .. ")")
+    end
+    pushState()
+end
+
+local function currentItem()
+    local id = panel.visible[panel.sel]
+    if id then return findById(id) end
+end
+
+-- ── HTML shell ────────────────────────────────────────────────────────────────
+-- Rebuilt with the current rows each show so the JS sees data at parse time (no
+-- async render race). textContent (not innerHTML) for all clip text, so a clip can
+-- never inject markup.
+local function panelHTML(rowsJSON)
+    return [[<!DOCTYPE html><html><head><meta charset="utf-8"><style>
+* { margin:0; padding:0; box-sizing:border-box; }
+html,body { background:transparent; }
+body { font:13px -apple-system,system-ui,sans-serif; color:#fff; padding:18px;
+       -webkit-user-select:none; cursor:default; }
+#panel { background:rgba(28,28,30,0.82); -webkit-backdrop-filter:blur(28px) saturate(180%);
+         border:0.5px solid rgba(255,255,255,0.14); border-radius:13px;
+         box-shadow:0 18px 60px rgba(0,0,0,0.6); overflow:hidden;
+         height:calc(100vh - 36px); display:flex; flex-direction:column; position:relative; }
+#q { display:flex; align-items:center; gap:8px; padding:13px 18px;
+     border-bottom:0.5px solid rgba(255,255,255,0.10); font-size:16px; }
+#q .icon { opacity:0.45; }
+#q .text { flex:1; white-space:pre; overflow:hidden; text-overflow:ellipsis; }
+#q .ph { color:rgba(235,235,245,0.4); }
+#q .caret { width:1.5px; height:18px; background:rgba(10,132,255,0.95);
+            display:inline-block; animation:blink 1.1s steps(1) infinite; }
+@keyframes blink { 50% { opacity:0; } }
+#list { flex:1; overflow-y:auto; padding:6px; }
+#list::-webkit-scrollbar { width:0; }
+.item { display:flex; align-items:center; gap:10px; padding:9px 12px;
+        border-radius:8px; }
+.item.sel { background:rgba(10,132,255,0.9); }
+.badge { flex:0 0 auto; font-size:10px; font-weight:700; letter-spacing:0.4px;
+         text-transform:uppercase; padding:2px 6px; border-radius:5px;
+         background:rgba(255,255,255,0.14); color:rgba(255,255,255,0.9); }
+.badge.text  { background:rgba(142,142,147,0.30); }
+.badge.url   { background:rgba(10,132,255,0.32); }
+.badge.image { background:rgba(191,90,242,0.32); }
+.badge.file  { background:rgba(50,215,75,0.30); }
+.badge.rich  { background:rgba(255,159,10,0.32); }
+.item.sel .badge { background:rgba(255,255,255,0.28); color:#fff; }
+.txt { flex:1; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.thumb { flex:0 0 auto; height:34px; max-width:90px; border-radius:4px;
+         object-fit:cover; background:rgba(255,255,255,0.08); }
+#empty { color:rgba(235,235,245,0.4); text-align:center; padding:40px; }
+#foot { display:flex; gap:14px; padding:9px 16px; font-size:11px;
+        color:rgba(235,235,245,0.55); border-top:0.5px solid rgba(255,255,255,0.10);
+        white-space:nowrap; overflow:hidden; }
+#foot b { color:rgba(255,255,255,0.85); font-weight:600; }
+#help { position:absolute; inset:0; background:rgba(20,20,22,0.96);
+        -webkit-backdrop-filter:blur(20px); display:none; flex-direction:column;
+        padding:22px 26px; gap:2px; }
+#help h2 { font-size:15px; margin-bottom:12px; }
+#help .row { display:flex; justify-content:space-between; padding:6px 0;
+             border-bottom:0.5px solid rgba(255,255,255,0.06); }
+#help kbd { font:11px ui-monospace,monospace; background:rgba(255,255,255,0.12);
+            padding:2px 7px; border-radius:5px; }
+#help .hint { margin-top:14px; font-size:11px; color:rgba(235,235,245,0.5); }
+</style></head><body><div id="panel">
+<div id="q"><span class="icon">⌕</span><span class="text"></span></div>
+<div id="list"></div>
+<div id="foot"></div>
+<div id="help">
+  <h2>Clipboard controls</h2>
+  <div class="row"><span>Move selection</span><span><kbd>↑</kbd> <kbd>↓</kbd></span></div>
+  <div class="row"><span>Paste into active window</span><kbd>↩</kbd></div>
+  <div class="row"><span>Paste &amp; keep panel open</span><kbd>⌘ ↩</kbd></div>
+  <div class="row"><span>Copy to clipboard (manual paste)</span><kbd>⌘ C</kbd></div>
+  <div class="row"><span>Quick Look</span><kbd>⌘ Y</kbd></div>
+  <div class="row"><span>Save to Desktop</span><kbd>⌘ S</kbd></div>
+  <div class="row"><span>Show in Finder</span><kbd>⌘ R</kbd></div>
+  <div class="row"><span>Share</span><kbd>⌘ ⇧ S</kbd></div>
+  <div class="row"><span>Delete entry</span><kbd>⌘ ⌫</kbd></div>
+  <div class="row"><span>Clear all history</span><kbd>⌘ ⇧ ⌫</kbd></div>
+  <div class="row"><span>Close panel</span><kbd>esc</kbd></div>
+  <div class="hint">Type to search · press <kbd>?</kbd> to toggle this overlay</div>
+</div>
+</div>
+<script>
+let MAP = {}, order = [], visible = [], sel = 0, query = "", helpOn = false;
+const KIND = { text:"text", rich:"rich", image:"image", file:"file", url:"url" };
+const listEl = document.getElementById('list');
+const qText  = document.querySelector('#q .text');
+const footEl = document.getElementById('foot');
+const helpEl = document.getElementById('help');
+
+footEl.innerHTML =
+  '<span><b>↩</b> Paste</span><span><b>⌘↩</b> Keep open</span>' +
+  '<span><b>⌘C</b> Copy</span><span><b>⌘Y</b> Quick Look</span>' +
+  '<span><b>⌘⌫</b> Delete</span><span style="margin-left:auto"><b>?</b> Controls</span>';
+
+function loadItems(items) {
+  MAP = {}; order = items.map(i => { MAP[i.id] = i; return i.id; });
+}
+
+function setState(ids, s, q, h) {
+  visible = ids; sel = s; query = q; helpOn = h; draw();
+}
+
+function drawQuery() {
+  qText.textContent = '';
+  if (query.length === 0) {
+    const ph = document.createElement('span'); ph.className = 'ph';
+    ph.textContent = 'Clipboard history'; qText.appendChild(ph);
+  } else {
+    qText.appendChild(document.createTextNode(query));
+  }
+  const caret = document.createElement('span'); caret.className = 'caret';
+  qText.appendChild(caret);
+}
+
+function draw() {
+  drawQuery();
+  helpEl.style.display = helpOn ? 'flex' : 'none';
+  listEl.innerHTML = '';
+  if (visible.length === 0) {
+    const e = document.createElement('div'); e.id = 'empty';
+    e.textContent = order.length ? 'No matches' : 'No clipboard history yet';
+    listEl.appendChild(e); return;
+  }
+  visible.forEach((id, i) => {
+    const it = MAP[id]; if (!it) return;
+    const row = document.createElement('div');
+    row.className = 'item' + (i === sel ? ' sel' : '');
+    const b = document.createElement('span');
+    b.className = 'badge ' + (KIND[it.kind] || '');
+    b.textContent = KIND[it.kind] || it.kind; row.appendChild(b);
+    const t = document.createElement('span'); t.className = 'txt';
+    t.textContent = it.preview; row.appendChild(t);
+    if (it.thumb) { const im = document.createElement('img');
+      im.className = 'thumb'; im.src = it.thumb; row.appendChild(im); }
+    row.addEventListener('click', () => post({ action:'paste', id:id }));
+    listEl.appendChild(row);
+  });
+  const cur = listEl.children[sel];
+  if (cur && cur.scrollIntoView) cur.scrollIntoView({ block:'nearest' });
+}
+
+function post(o) { window.webkit.messageHandlers.clipMgr.postMessage(o); }
+
+loadItems(]] .. rowsJSON .. [[);
+setState(order.slice(), 0, "", false);
+</script></body></html>]]
+end
+
+local screen = hs.screen.mainScreen():frame()
+local W, H = 720, 520
+local rect = {
+    x = screen.x + (screen.w - W) / 2,
+    y = screen.y + (screen.h - H) / 3,
+    w = W, h = H,
+}
+
+local userContent = hs.webview.usercontent.new("clipMgr")
+
+_G.clipboardMgrWebview = hs.webview.new(rect, { developerExtrasEnabled = false }, userContent)
+    :windowStyle({ "borderless" })
+    :transparent(true)               -- let the CSS rounded panel show through
+    :level(hs.drawing.windowLevels.modalPanel)
+    :deleteOnClose(false)
+
+-- ── Open / close ──────────────────────────────────────────────────────────────
+local function closePanel()
+    _G.clipboardMgrOpen = false
+    if _G.clipboardMgrTap then _G.clipboardMgrTap:stop() end
+    if _G.clipboardMgrWebview then _G.clipboardMgrWebview:hide() end
+end
+
 local function showPanel()
     _G.clipboardMgrTargetApp = hs.application.frontmostApplication()
+    panel.rows  = buildRows()
+    panel.query = ""
+    panel.sel   = 1
+    panel.help  = false
+    refilter()
     -- gsub guards against a clip's text closing the inline <script> early.
-    local json = (hs.json.encode(buildRows()) or "[]"):gsub("</", "<\\/")
+    -- Empty Lua table encodes as "{}" (object); force "[]" so JS gets an array.
+    local json = ((#panel.rows > 0 and hs.json.encode(panel.rows)) or "[]"):gsub("</", "<\\/")
     _G.clipboardMgrWebview:html(panelHTML(json))
     _G.clipboardMgrWebview:show():bringToFront(true)
-    -- autofocus is unreliable right after an html swap; nudge focus explicitly.
-    hs.timer.doAfter(0.05, function()
-        _G.clipboardMgrWebview:evaluateJavaScript("document.getElementById('q').focus()")
-    end)
+    _G.clipboardMgrOpen = true
+    if _G.clipboardMgrTap then _G.clipboardMgrTap:start() end
 end
 
-_G.clipboardMgrHotkey = hs.hotkey.bind(HYPER, "v", showPanel)
+-- ── Keyboard (global eventtap, live only while the panel is open) ──────────────
+-- Borderless webviews can't take key focus, so we own the keyboard here. Every
+-- keydown is consumed (the panel is modal); only the bindings below act.
+local KEY = { ESC = 53, RET = 36, UP = 126, DOWN = 125, BKSP = 51,
+              C = 8, S = 1, R = 15, Y = 16, V = 9, SLASH = 44 }
+
+local function moveSel(delta)
+    panel.sel = math.max(1, math.min(panel.sel + delta, #panel.visible))
+    pushState()
+end
+
+_G.clipboardMgrTap = eventtap.new({ eventtap.event.types.keyDown }, function(e)
+    local ok, err = pcall(function()
+        local code = e:getKeyCode()
+        local f    = e:getFlags()
+        local cmd  = f.cmd and not f.alt and not f.ctrl
+
+        -- Hyper+V again must toggle the panel shut (#12). While open, this tap
+        -- swallows every key, so the global hotkey can't fire — handle it here.
+        if code == KEY.V and f.cmd and f.ctrl and f.alt and f.shift then
+            closePanel()
+        elseif code == KEY.ESC then
+            if panel.help then panel.help = false; pushState() else closePanel() end
+
+        elseif code == KEY.UP then moveSel(-1)
+        elseif code == KEY.DOWN then moveSel(1)
+
+        elseif code == KEY.RET then
+            local it = currentItem()
+            if it then
+                if f.cmd then repaste(it)          -- ⌘↩ paste & keep open
+                else closePanel(); repaste(it) end -- ↩ paste & close
+            end
+
+        elseif code == KEY.BKSP then
+            if cmd and f.shift then clearAll(); reloadRows()
+            elseif cmd then
+                local it = currentItem()
+                if it then deleteItem(it.id); reloadRows() end
+            elseif panel.query ~= "" then
+                -- Drop one UTF-8 char (handles multi-byte tails).
+                panel.query = panel.query:gsub("[\128-\191]*[^\128-\191]$", "")
+                panel.sel = 1; refilter(); pushState()
+            end
+
+        elseif cmd and code == KEY.C then
+            local it = currentItem()
+            if it then stageClipboard(it, true) end
+            closePanel()
+
+        elseif cmd and code == KEY.Y then
+            local it = currentItem(); if it then quickLook(it) end
+        elseif cmd and code == KEY.S and f.shift then
+            local it = currentItem(); if it then shareItem(it) end
+        elseif cmd and code == KEY.S then
+            local it = currentItem(); if it then saveToDesktop(it) end
+        elseif cmd and code == KEY.R then
+            local it = currentItem(); if it then revealInFinder(it) end
+
+        elseif code == KEY.SLASH and f.shift then
+            panel.help = not panel.help; pushState()
+
+        elseif not f.cmd and not f.ctrl and not f.alt then
+            -- Typing into the search box.
+            local ch = e:getCharacters(false)
+            if ch and #ch >= 1 and ch:byte(1) >= 32 then
+                panel.query = panel.query .. ch
+                panel.sel = 1; refilter(); pushState()
+            end
+        end
+    end)
+    if not ok then closePanel() end -- never leave the keyboard captured on error
+    return true                     -- modal: swallow every key while open
+end)
+
+-- Mouse clicks (JS → Lua). Keyboard never routes here.
+userContent:setCallback(function(msg)
+    local m = (type(msg) == "table" and msg.body) and msg.body or msg
+    if type(m) ~= "table" then return end
+    if m.action == "paste" then
+        local item = findById(tonumber(m.id))
+        closePanel()
+        if item then repaste(item) end
+    end
+end)
+
+-- ── Hotkey (toggle — issue #12) ───────────────────────────────────────────────
+_G.clipboardMgrHotkey = hs.hotkey.bind(HYPER, "v", function()
+    if _G.clipboardMgrOpen then closePanel() else showPanel() end
+end)
 
 -- ── CLI exposure (hs -c) ──────────────────────────────────────────────────────
-_G.clipboardMgrShow = showPanel
-_G.clipboardMgrClear = function()
-    for _, it in ipairs(history) do removeBlobs(it) end
-    for i = #history, 1, -1 do table.remove(history, i) end -- empty in place; keep the upvalue
-    saveHistory()
-end
+_G.clipboardMgrShow  = showPanel
+_G.clipboardMgrClear = clearAll

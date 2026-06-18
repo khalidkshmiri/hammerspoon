@@ -20,8 +20,12 @@ mouse-driven window management plus a set of keyboard/input/automation shortcuts
     Space when those apps launch. Capture the current layout with `hs -c "captureLayout()"`.
   - `paste_manager.lua` — Cmd+V pastes WITHOUT formatting (strips rich text);
     Cmd+Opt+V keeps formatting. Files/images pass through unchanged.
-  - `clipboard_ring.lua` — keeps the last N text clips; Hyper+V opens a searchable
-    picker to paste an older one.
+  - `clipboard_manager.lua` — Hyper+V toggles a native-style, keyboard-driven
+    history panel (text/rich/image/file/URL, persists across reboots). Keyboard is
+    driven by a global `hs.eventtap` that's live only while the panel shows, because
+    a borderless webview can't take key focus. Bindings: ↩ paste · ⌘↩ paste+keep
+    open · ⌘C copy · ⌘Y Quick Look · ⌘S save to Desktop · ⌘R reveal · ⌘⇧S share ·
+    ⌘⌫ delete · ⌘⇧⌫ clear all · `?` controls overlay · esc close.
   - `dock_quit.lua` — middle-click a Dock icon to quit that app (≡ ⌘Q).
   - `menubar_quit.lua` — middle-click a third-party menu-bar icon to quit its app.
   - `horizontal_scroll.lua` — hold Shift while scrolling to scroll horizontally.
