@@ -1,15 +1,29 @@
 package.loaded["modules.dock_quit"] = nil
 
--- ── Middle-click a Dock icon to quit the app ──────────────────────────────────
--- Middle-clicking a running app's Dock icon quits it gracefully (≡ ⌘Q).
--- Anything else (non-running icons, Finder/Trash/stacks, minimized windows, or
--- middle-clicks outside the Dock) passes through untouched.
+-- ── Quit a Dock app: middle-click, or Hyper+click ─────────────────────────────
+-- Two ways to quit a running app's Dock icon gracefully (≡ ⌘Q):
+--   • Middle-click           — for a mouse with a middle button.
+--   • Hyper+click (⌘⌃⌥⇧)     — trackpad parity, since a MacBook has no middle button.
+-- Hyper is used because no system Dock gesture claims it (unlike ⌘-click = reveal in
+-- Finder, ⌃-click = menu, ⌥-click = hide others). Anything else (non-running icons,
+-- protected apps, Trash/stacks, minimized windows, clicks outside the Dock) passes
+-- through untouched.
 
 if _G.dockQuitTap then _G.dockQuitTap:stop() end
 
 local eventtap = hs.eventtap
 local ax       = hs.axuielement
 local types    = eventtap.event.types
+
+-- Bundle IDs we never quit: killing these is pointless (they relaunch) or self-defeating.
+local PROTECTED = {
+    ["com.apple.finder"]            = true,
+    ["com.apple.dock"]              = true,
+    ["com.apple.controlcenter"]     = true,
+    ["com.apple.systemuiserver"]    = true,
+    ["com.apple.Spotlight"]         = true,
+    ["org.hammerspoon.Hammerspoon"] = true,
+}
 
 -- Find the AXDockItem under the given screen point, or nil. We hit-test each dock
 -- item's own frame rather than using elementAtPosition, which can return a child
@@ -52,25 +66,47 @@ local function appForItem(item)
     return nil
 end
 
-_G.dockQuitTap = eventtap.new({ types.otherMouseDown }, function(e)
-    -- Button 2 is the middle button (0=left, 1=right).
-    if not e:getButtonState(2) then return false end
-
-    local item = dockItemAt(hs.mouse.absolutePosition())
+-- Quit the running app whose Dock icon is under `point`. Returns true only when it
+-- actually killed something (so the caller knows whether to swallow the click).
+local function quitAppAtDock(point)
+    local item = dockItemAt(point)
     if not item then return false end
 
     -- Only application icons that are actually running. Excludes the separator,
-    -- Trash, Downloads/stacks, Finder, minimized window thumbnails, and apps that
-    -- aren't open.
+    -- Trash, Downloads/stacks, minimized window thumbnails, and apps that aren't open.
     if item.AXSubrole ~= "AXApplicationDockItem" then return false end
     if not item.AXIsApplicationRunning then return false end
 
     local app = appForItem(item)
     if not app then return false end
 
+    -- Skip Finder/Dock/system UI: killing them is pointless (they relaunch).
+    local bundleID = app:bundleID()
+    if bundleID and PROTECTED[bundleID] then return false end
+
     app:kill() -- graceful terminate, equivalent to ⌘Q
 
-    return true -- swallow only the clicks we actually handle
+    return true
+end
+
+-- One tap for both triggers. NOTE: window_manager also taps leftMouseDown for Hyper+drag;
+-- dock_quit is loaded *after* it in init.lua, so this tap sits at the event-chain head and
+-- sees the click first — swallowing it (return true) here keeps window_manager from also
+-- acting on a Hyper+click over the Dock. Don't reorder the loads in init.lua.
+_G.dockQuitTap = eventtap.new({ types.otherMouseDown, types.leftMouseDown }, function(e)
+    if e:getType() == types.otherMouseDown then
+        -- Button 2 is the middle button (0=left, 1=right).
+        if not e:getButtonState(2) then return false end
+    else
+        -- leftMouseDown: only act on a Hyper+click. Read the event's own flags rather
+        -- than a flagsChanged-tracked state — Karabiner can make that state stale
+        -- relative to the click (see window_manager.lua). The cheap flag check first
+        -- means ordinary left-clicks fall straight through.
+        local f = e:getFlags()
+        if not (f.cmd and f.ctrl and f.alt and f.shift) then return false end
+    end
+
+    return quitAppAtDock(hs.mouse.absolutePosition()) -- swallow only the clicks we handle
 end)
 
 _G.dockQuitTap:start()
