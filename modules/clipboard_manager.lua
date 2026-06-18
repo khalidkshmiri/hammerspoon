@@ -480,6 +480,9 @@ body { font:13px -apple-system,system-ui,sans-serif; color:#fff; padding:18px;
 .item { display:flex; align-items:center; gap:10px; padding:9px 12px;
         border-radius:8px; }
 .item.sel { background:rgba(10,132,255,0.9); }
+.num { flex:0 0 auto; width:15px; text-align:center; font:11px ui-monospace,monospace;
+       color:rgba(235,235,245,0.4); }
+.item.sel .num { color:rgba(255,255,255,0.85); }
 .badge { flex:0 0 auto; font-size:10px; font-weight:700; letter-spacing:0.4px;
          text-transform:uppercase; padding:2px 6px; border-radius:5px;
          background:rgba(255,255,255,0.14); color:rgba(255,255,255,0.9); }
@@ -513,6 +516,7 @@ body { font:13px -apple-system,system-ui,sans-serif; color:#fff; padding:18px;
 <div id="help">
   <h2>Clipboard controls</h2>
   <div class="row"><span>Move selection</span><span><kbd>↑</kbd> <kbd>↓</kbd></span></div>
+  <div class="row"><span>Quick-paste item N (keeps order &amp; panel open)</span><span><kbd>1</kbd>–<kbd>9</kbd> <kbd>0</kbd></span></div>
   <div class="row"><span>Paste into active window</span><kbd>↩</kbd></div>
   <div class="row"><span>Paste &amp; keep panel open</span><kbd>⌘ ↩</kbd></div>
   <div class="row"><span>Copy to clipboard (manual paste)</span><kbd>⌘ C</kbd></div>
@@ -535,7 +539,7 @@ const footEl = document.getElementById('foot');
 const helpEl = document.getElementById('help');
 
 footEl.innerHTML =
-  '<span><b>↩</b> Paste</span><span><b>⌘↩</b> Keep open</span>' +
+  '<span><b>1–9</b> Quick paste</span><span><b>↩</b> Paste</span>' +
   '<span><b>⌘C</b> Copy</span><span><b>⌘Y</b> Quick Look</span>' +
   '<span><b>⌘⌫</b> Delete</span><span style="margin-left:auto"><b>?</b> Controls</span>';
 
@@ -572,6 +576,9 @@ function draw() {
     const it = MAP[id]; if (!it) return;
     const row = document.createElement('div');
     row.className = 'item' + (i === sel ? ' sel' : '');
+    const n = document.createElement('span'); n.className = 'num';
+    n.textContent = i < 10 ? String((i + 1) % 10) : '';  // 1..9 then 0 for the 10th
+    row.appendChild(n);
     const b = document.createElement('span');
     b.className = 'badge ' + (KIND[it.kind] || '');
     b.textContent = KIND[it.kind] || it.kind; row.appendChild(b);
@@ -695,9 +702,17 @@ _G.clipboardMgrTap = eventtap.new({ eventtap.event.types.keyDown }, function(e)
             panel.help = not panel.help; pushState()
 
         elseif not f.cmd and not f.ctrl and not f.alt then
-            -- Typing into the search box.
             local ch = e:getCharacters(false)
-            if ch and #ch >= 1 and ch:byte(1) >= 32 then
+            -- Plain digit = quick-paste the Nth visible item (1..9, 0 = 10th). The
+            -- panel stays open and history order is untouched, so the numbers stay
+            -- stable across repeated pastes. A digit only reaches here unshifted
+            -- (shift+digit yields a symbol), so digits never go to the search box.
+            if ch and ch:match("^%d$") then
+                local n   = tonumber(ch)
+                local id  = panel.visible[(n == 0) and 10 or n]
+                if id then local it = findById(id); if it then repaste(it) end end
+            elseif ch and #ch >= 1 and ch:byte(1) >= 32 then
+                -- Typing into the search box.
                 panel.query = panel.query .. ch
                 panel.sel = 1; refilter(); pushState()
             end
