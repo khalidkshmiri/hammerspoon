@@ -1,2 +1,5 @@
 .DS_Store
 *.log
+
+# graphify code-graph output (regenerable, rebuilt by post-commit hook)
+graphify-out/
