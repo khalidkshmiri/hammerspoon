@@ -1,9 +1,13 @@
 package.loaded["modules.menubar_quit"] = nil
 
--- ── Middle-click a menu-bar icon to quit its app ──────────────────────────────
--- Middle-clicking a third-party menu-bar status item quits the app that owns it
--- (≡ ⌘Q). Apple's own system items (Control Center, clock, Spotlight, Wi-Fi…) and
--- Finder are left alone, as is any middle-click outside the menu-bar strip.
+-- ── Quit a menu-bar item: middle-click, or Hyper+click ────────────────────────
+-- Two ways to quit the app owning a third-party menu-bar status item, gracefully
+-- (≡ ⌘Q):
+--   • Middle-click           — for a mouse with a middle button.
+--   • Hyper+click (⌘⌃⌥⇧)     — trackpad parity, since a MacBook has no middle button.
+-- Hyper is used because no system menu-bar gesture claims it (same reasoning as
+-- dock_quit.lua). Apple's own system items (Control Center, clock, Spotlight, Wi-Fi…),
+-- Finder, and clicks outside the menu-bar strip are left alone.
 
 if _G.menubarQuitTap then _G.menubarQuitTap:stop() end
 
@@ -35,9 +39,21 @@ local function menubarBottom(point)
     return nil
 end
 
-_G.menubarQuitTap = eventtap.new({ types.otherMouseDown }, function(e)
-    -- Button 2 is the middle button (0=left, 1=right).
-    if not e:getButtonState(2) then return false end
+-- NOTE: window_manager also taps leftMouseDown for Hyper+drag; menubar_quit is loaded
+-- after it in init.lua, so this tap sits at the event-chain head and sees the click
+-- first — swallowing it (return true) here keeps window_manager from also acting on a
+-- Hyper+click over the menu bar. Don't reorder the loads in init.lua.
+_G.menubarQuitTap = eventtap.new({ types.otherMouseDown, types.leftMouseDown }, function(e)
+    if e:getType() == types.otherMouseDown then
+        -- Button 2 is the middle button (0=left, 1=right).
+        if not e:getButtonState(2) then return false end
+    else
+        -- leftMouseDown: only act on a Hyper+click. Read the event's own flags rather
+        -- than a flagsChanged-tracked state — Karabiner can make that state stale
+        -- relative to the click (see window_manager.lua).
+        local f = e:getFlags()
+        if not (f.cmd and f.ctrl and f.alt and f.shift) then return false end
+    end
 
     local pos    = hs.mouse.absolutePosition()
     local bottom = menubarBottom(pos)
