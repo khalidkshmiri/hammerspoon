@@ -30,12 +30,6 @@ local MIN_WIN_H             = 100
 local MIN_VISIBLE_X         = 100  -- min px of window width that must remain on-screen horizontally
 local MIN_VISIBLE_Y         = 30   -- min px of window height that must remain on-screen vertically
 
--- Modifiers that must be held to activate window management.
--- Default is the Hyper key (all four). To use a lighter combo, remove entries:
---   Cmd + Ctrl only:       { cmd = true, ctrl = true }
---   Cmd + Ctrl + Opt:      { cmd = true, ctrl = true, alt = true }
-local MODIFIER = { cmd = true, ctrl = true, alt = true, shift = true }
-
 local dragState   = {}
 local dragGen     = 0
 local lastClick   = { time = 0, winId = nil }
@@ -98,15 +92,6 @@ local function inResizeZone(pos, f)
            pos.y <= f.y + RESIZE_MARGIN or pos.y >= f.y + f.h - RESIZE_MARGIN
 end
 
-local function resizeEdges(pos, f)
-    return {
-        left   = pos.x <= f.x + RESIZE_MARGIN,
-        right  = pos.x >= f.x + f.w - RESIZE_MARGIN,
-        top    = pos.y <= f.y + RESIZE_MARGIN,
-        bottom = pos.y >= f.y + f.h - RESIZE_MARGIN,
-    }
-end
-
 -- Maps cursor position to the nearest corner of the window using quadrants.
 -- Used for Hyper+right-drag: resize from anywhere, not just the edge zone.
 local function quadrantEdges(pos, f)
@@ -155,6 +140,62 @@ local function doMaximize(win, winId, currentF)
     savedFrames[winId] = { pre = currentF, max = maxF }
     withAnimation(function() win:maximize() end)
     win:focus()
+end
+
+local function resizedFrame(initF, edges, dx, dy)
+    local newX, newY, newW, newH = initF.x, initF.y, initF.w, initF.h
+    if edges.left then
+        newW = max(MIN_WIN_W, initF.w - dx)
+        newX = initF.x + initF.w - newW
+    elseif edges.right then
+        newW = max(MIN_WIN_W, initF.w + dx)
+    end
+    if edges.top then
+        newH = max(MIN_WIN_H, initF.h - dy)
+        newY = initF.y + initF.h - newH
+    elseif edges.bottom then
+        newH = max(MIN_WIN_H, initF.h + dy)
+    end
+    return { x = newX, y = newY, w = newW, h = newH }
+end
+
+local function flushResize(state)
+    pcall(state.window.setFrame, state.window, resizedFrame(state.initFrame, state.edges, state.totalDX, state.totalDY))
+end
+
+local function newResizeState(win, frame, edges, pos)
+    local state = {
+        window = win,
+        isResize = true,
+        isCmdDrag = true,
+        didDrag = false,
+        edges = edges,
+        initFrame = frame,
+        initMouseX = pos.x,
+        initMouseY = pos.y,
+        totalDX = 0,
+        totalDY = 0,
+        dirty = false,
+    }
+    state.resizeTimer = hs.timer.doEvery(1/60, function()
+        if not state.dirty then return end
+        state.dirty = false
+        flushResize(state)
+    end)
+    return state
+end
+
+local function stopResize(state)
+    if not state.resizeTimer then return end
+    if state.dirty then flushResize(state) end
+    state.resizeTimer:stop()
+    state.resizeTimer = nil
+end
+
+local function resetScrollTarget()
+    if scrollTarget.releaseTimer then scrollTarget.releaseTimer:stop() end
+    if scrollTarget.updateTimer then scrollTarget.updateTimer:stop() end
+    scrollTarget = { win = nil, releaseTimer = nil, updateTimer = nil, edges = nil, initFrame = nil, totalDX = 0, totalDY = 0, dirty = false }
 end
 
 _G.windowDragger = hs.eventtap.new({ EV_DOWN, EV_DRAG, EV_UP, EV_RDOWN, EV_RDRAG, EV_RUP, EV_SCROLL }, function(event)
@@ -239,46 +280,12 @@ _G.windowDragger = hs.eventtap.new({ EV_DOWN, EV_DRAG, EV_UP, EV_RDOWN, EV_RDRAG
 
         if inResizeZone(pos, f) then
             savedFrames[winId] = nil
-            local initF = { x = f.x, y = f.y, w = f.w, h = f.h }
-            local ds = {
-                window       = win,
-                isResize     = true,
-                edges        = quadrantEdges(pos, f),
-                isCmdDrag    = true,
-                didDrag      = false,
-                initMouseX   = pos.x,
-                initMouseY   = pos.y,
-                initFrame    = initF,
-                totalDX      = 0,
-                totalDY      = 0,
-                dirty        = false,
-            }
-            -- 60fps timer flushes accumulated deltas to setFrame, same as scroll resize.
-            -- Keeps drag smooth even when the target app is slow to respond to AX calls.
-            ds.resizeTimer = hs.timer.doEvery(1/60, function()
-                if not ds.dirty then return end
-                ds.dirty = false
-                local e     = ds.edges
-                local initF = ds.initFrame
-                local newX  = initF.x
-                local newY  = initF.y
-                local newW  = initF.w
-                local newH  = initF.h
-                if e.left then
-                    newW = max(MIN_WIN_W, initF.w - ds.totalDX)
-                    newX = initF.x + initF.w - newW
-                elseif e.right then
-                    newW = max(MIN_WIN_W, initF.w + ds.totalDX)
-                end
-                if e.top then
-                    newH = max(MIN_WIN_H, initF.h - ds.totalDY)
-                    newY = initF.y + initF.h - newH
-                elseif e.bottom then
-                    newH = max(MIN_WIN_H, initF.h + ds.totalDY)
-                end
-                pcall(ds.window.setFrame, ds.window, { x = newX, y = newY, w = newW, h = newH })
-            end)
-            dragState = ds
+            dragState = newResizeState(
+                win,
+                { x = f.x, y = f.y, w = f.w, h = f.h },
+                quadrantEdges(pos, f),
+                pos
+            )
             return true
         end
 
@@ -395,31 +402,7 @@ _G.windowDragger = hs.eventtap.new({ EV_DOWN, EV_DRAG, EV_UP, EV_RDOWN, EV_RDRAG
     -- ── Mouse up ─────────────────────────────────────────────────────────────
     elseif eventType == EV_UP then
         if dragState.window then
-            if dragState.resizeTimer then
-                -- Flush any last pending delta before stopping the timer.
-                if dragState.dirty then
-                    local e     = dragState.edges
-                    local initF = dragState.initFrame
-                    local newX  = initF.x
-                    local newY  = initF.y
-                    local newW  = initF.w
-                    local newH  = initF.h
-                    if e.left then
-                        newW = max(MIN_WIN_W, initF.w - dragState.totalDX)
-                        newX = initF.x + initF.w - newW
-                    elseif e.right then
-                        newW = max(MIN_WIN_W, initF.w + dragState.totalDX)
-                    end
-                    if e.top then
-                        newH = max(MIN_WIN_H, initF.h - dragState.totalDY)
-                        newY = initF.y + initF.h - newH
-                    elseif e.bottom then
-                        newH = max(MIN_WIN_H, initF.h + dragState.totalDY)
-                    end
-                    pcall(dragState.window.setFrame, dragState.window, { x = newX, y = newY, w = newW, h = newH })
-                end
-                dragState.resizeTimer:stop()
-            end
+            stopResize(dragState)
             if dragState.isCmdDrag then
                 if not dragState.didDrag then
                     lastClick = { time = hs.timer.secondsSinceEpoch(), winId = dragState.window:id() }
@@ -446,45 +429,12 @@ _G.windowDragger = hs.eventtap.new({ EV_DOWN, EV_DRAG, EV_UP, EV_RDOWN, EV_RDRAG
         local winId = win:id()
         savedFrames[winId] = nil
 
-        local initF = { x = f.x, y = f.y, w = f.w, h = f.h }
-        local ds = {
-            window       = win,
-            isResize     = true,
-            edges        = quadrantEdges(pos, f),
-            isCmdDrag    = true,
-            didDrag      = false,
-            initMouseX   = pos.x,
-            initMouseY   = pos.y,
-            initFrame    = initF,
-            totalDX      = 0,
-            totalDY      = 0,
-            dirty        = false,
-        }
-        -- 60fps timer applies accumulated deltas to setFrame, same as scroll/left-drag resize.
-        ds.resizeTimer = hs.timer.doEvery(1/60, function()
-            if not ds.dirty then return end
-            ds.dirty = false
-            local e     = ds.edges
-            local iF    = ds.initFrame
-            local newX  = iF.x
-            local newY  = iF.y
-            local newW  = iF.w
-            local newH  = iF.h
-            if e.left then
-                newW = max(MIN_WIN_W, iF.w - ds.totalDX)
-                newX = iF.x + iF.w - newW
-            elseif e.right then
-                newW = max(MIN_WIN_W, iF.w + ds.totalDX)
-            end
-            if e.top then
-                newH = max(MIN_WIN_H, iF.h - ds.totalDY)
-                newY = iF.y + iF.h - newH
-            elseif e.bottom then
-                newH = max(MIN_WIN_H, iF.h + ds.totalDY)
-            end
-            pcall(ds.window.setFrame, ds.window, { x = newX, y = newY, w = newW, h = newH })
-        end)
-        dragState = ds
+        dragState = newResizeState(
+            win,
+            { x = f.x, y = f.y, w = f.w, h = f.h },
+            quadrantEdges(pos, f),
+            pos
+        )
         return true
 
     -- ── Right mouse drag: accumulate delta for 60fps timer ───────────────────
@@ -500,31 +450,7 @@ _G.windowDragger = hs.eventtap.new({ EV_DOWN, EV_DRAG, EV_UP, EV_RDOWN, EV_RDRAG
     -- ── Right mouse up: flush final frame and stop timer ─────────────────────
     elseif eventType == EV_RUP then
         if dragState.window then
-            if dragState.resizeTimer then
-                -- Final flush so the last drag position is always committed.
-                if dragState.dirty then
-                    local e     = dragState.edges
-                    local iF    = dragState.initFrame
-                    local newX  = iF.x
-                    local newY  = iF.y
-                    local newW  = iF.w
-                    local newH  = iF.h
-                    if e.left then
-                        newW = max(MIN_WIN_W, iF.w - dragState.totalDX)
-                        newX = iF.x + iF.w - newW
-                    elseif e.right then
-                        newW = max(MIN_WIN_W, iF.w + dragState.totalDX)
-                    end
-                    if e.top then
-                        newH = max(MIN_WIN_H, iF.h - dragState.totalDY)
-                        newY = iF.y + iF.h - newH
-                    elseif e.bottom then
-                        newH = max(MIN_WIN_H, iF.h + dragState.totalDY)
-                    end
-                    pcall(dragState.window.setFrame, dragState.window, { x = newX, y = newY, w = newW, h = newH })
-                end
-                dragState.resizeTimer:stop()
-            end
+            stopResize(dragState)
             dragState = {}
             return true
         end
@@ -548,37 +474,19 @@ _G.windowDragger = hs.eventtap.new({ EV_DOWN, EV_DRAG, EV_UP, EV_RDOWN, EV_RDRAG
         -- Edges are locked so the resize direction can't flip as the window grows/shrinks.
         if not scrollTarget.win then
             local f = win:frame()
-            scrollTarget.win       = win
-            scrollTarget.edges     = quadrantEdges(pos, f)
+            scrollTarget.win = win
+            scrollTarget.edges = quadrantEdges(pos, f)
             scrollTarget.initFrame = { x = f.x, y = f.y, w = f.w, h = f.h }
-            scrollTarget.totalDX   = 0
-            scrollTarget.totalDY   = 0
-            scrollTarget.dirty     = false
+            scrollTarget.totalDX = 0
+            scrollTarget.totalDY = 0
+            scrollTarget.dirty = false
             -- 60fps timer flushes accumulated deltas to setFrame independently of the
             -- event tap. This decouples the tap from slow app redraws (Xcode, Reminders)
             -- so the event queue never backs up — same principle as setTopLeft for move.
             scrollTarget.updateTimer = hs.timer.doEvery(1/60, function()
                 if not scrollTarget.dirty then return end
                 scrollTarget.dirty = false
-                local e     = scrollTarget.edges
-                local initF = scrollTarget.initFrame
-                local newX  = initF.x
-                local newY  = initF.y
-                local newW  = initF.w
-                local newH  = initF.h
-                if e.left then
-                    newW = max(MIN_WIN_W, initF.w - scrollTarget.totalDX)
-                    newX = initF.x + initF.w - newW
-                elseif e.right then
-                    newW = max(MIN_WIN_W, initF.w + scrollTarget.totalDX)
-                end
-                if e.top then
-                    newH = max(MIN_WIN_H, initF.h - scrollTarget.totalDY)
-                    newY = initF.y + initF.h - newH
-                elseif e.bottom then
-                    newH = max(MIN_WIN_H, initF.h + scrollTarget.totalDY)
-                end
-                pcall(scrollTarget.win.setFrame, scrollTarget.win, { x = newX, y = newY, w = newW, h = newH })
+                flushResize(scrollTarget)
             end)
         end
 
@@ -590,8 +498,7 @@ _G.windowDragger = hs.eventtap.new({ EV_DOWN, EV_DRAG, EV_UP, EV_RDOWN, EV_RDRAG
         -- Reset the release timer; on expiry stop the update timer and clean up.
         if scrollTarget.releaseTimer then scrollTarget.releaseTimer:stop() end
         scrollTarget.releaseTimer = hs.timer.doAfter(0.3, function()
-            if scrollTarget.updateTimer then scrollTarget.updateTimer:stop() end
-            scrollTarget = { win = nil, releaseTimer = nil, updateTimer = nil, edges = nil, initFrame = nil, totalDX = 0, totalDY = 0, dirty = false }
+            resetScrollTarget()
         end)
         return true
     end

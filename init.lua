@@ -19,19 +19,18 @@ end):start()
 require("hs.ipc")
 
 -- ── Modules ───────────────────────────────────────────────────────────────────
-local function load(mod)
+for _, mod in ipairs({
+    "modules.window_manager",
+    "modules.brightness_manager",
+    "modules.builtin_brightness_manager",
+    "modules.paste_manager",
+    "modules.click_quit",
+    "modules.clipboard_manager",
+    "modules.horizontal_scroll",
+    "modules.app_rules",
+}) do
     local ok, err = pcall(require, mod)
     if not ok then hs.alert.show("Error loading " .. mod .. ":\n" .. tostring(err)) end
 end
-
-load("modules.window_manager")
-load("modules.brightness_manager")
-load("modules.builtin_brightness_manager")
-load("modules.paste_manager")
-load("modules.dock_quit")
-load("modules.menubar_quit")
-load("modules.clipboard_manager")
-load("modules.horizontal_scroll")
-load("modules.app_rules")
 
 hs.alert.show("Config loaded")
