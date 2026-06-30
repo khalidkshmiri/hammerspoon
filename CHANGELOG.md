@@ -43,6 +43,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Hyper + drag no longer resizes instead of moving (or triggers Hide Others) after a
   Space switch.
 - Resize uses a 60fps timer instead of a canvas overlay to eliminate lag in slow apps.
+- Resize now stays inside the current screen until the pointer crosses onto another
+  display, at which point the dragged edge can continue expanding there.
 - Clipboard panel: Esc now dismisses it immediately, without first clicking the window.
 - Clipboard panel: Hyper+V again now dismisses the panel (toggle) instead of re-rendering.
 - Clipboard panel: keep-open pastes (numbered quick-paste and ⌘↩) now actually paste —
