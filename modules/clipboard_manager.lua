@@ -27,6 +27,8 @@ local PANEL_H = 430
 local DETAIL_W = 980
 local VISIBLE_ROWS = 8
 local QUERY_H = 58
+local SETTINGS_KEY = "clipboardMgr.history.v2"
+local CACHE_DIR = hs.fs.temporaryDirectory() .. "/hammerspoon-clipboard-manager"
 
 local RICH_UTIS = {
     ["public.rtf"] = true,
@@ -50,7 +52,12 @@ local MARKDOWN_UTIS = {
     ["text/markdown"] = true,
 }
 
-local rawHistory = _G.clipboardMgrHistory or {}
+-- Hammerspoon reloads wipe Lua userdata, so the stored history must be plain Lua
+-- data plus file paths. Images are mirrored into CACHE_DIR so a config reload does
+-- not make existing image entries unusable.
+hs.fs.mkdir(CACHE_DIR)
+
+local rawHistory = _G.clipboardMgrHistory or hs.settings.get(SETTINGS_KEY) or {}
 local history = rawHistory
 _G.clipboardMgrHistory = history
 _G.clipboardMgrTasks = _G.clipboardMgrTasks or {}
@@ -62,6 +69,7 @@ local panelVisible = false
 local detailMode = nil
 local statusText = ""
 local previousWindow = nil
+local panelHasInput = false
 local draggingPanel = false
 local dragStartMouse = nil
 local dragStartFrame = nil
@@ -126,6 +134,22 @@ local function setStatus(message)
     end)
 end
 
+local function reportError(context, err)
+    local message = "Clipboard manager " .. context .. " failed"
+    print(message .. ": " .. tostring(err))
+    hs.alert.show(message)
+    setStatus(message)
+end
+
+-- Pasteboard/webview callbacks used to fail silently; surfacing the failure keeps
+-- one unexpected clipboard format from forcing a full config reload to recover.
+local function guarded(context, fn, fallback)
+    local ok, result = xpcall(fn, debug.traceback)
+    if ok then return result end
+    reportError(context, result)
+    return fallback
+end
+
 local function hasHyper(flags)
     return flags.cmd and flags.ctrl and flags.alt and flags.shift
 end
@@ -164,6 +188,46 @@ end
 local function pathToFileURL(path)
     if type(path) ~= "string" then return "" end
     return "file://" .. percentEncodePath(path)
+end
+
+local function appendUnique(list, value)
+    if not value or value == "" then return end
+    for _, existing in ipairs(list) do
+        if existing == value then return end
+    end
+    table.insert(list, value)
+end
+
+local function extractFiles(types, urls)
+    local files = {}
+
+    for _, url in ipairs(urls or {}) do
+        appendUnique(files, fileURLToPath(url))
+    end
+
+    -- Finder still exposes copied files through legacy pasteboard UTIs on some
+    -- macOS paths. Reading these explicitly keeps folders/files visible even when
+    -- readURL() returns nil for the current pasteboard owner.
+    local filenames = safeCall(pb.readPListForUTI, nil, "NSFilenamesPboardType")
+        or safeCall(pb.readPListForUTI, nil, "com.apple.pasteboard.promised-file-url")
+    if type(filenames) == "table" then
+        for _, path in ipairs(filenames) do appendUnique(files, path) end
+    elseif type(filenames) == "string" then
+        appendUnique(files, filenames)
+    end
+
+    for _, uti in ipairs(types or {}) do
+        if uti == "public.file-url" or uti == "NSURLPboardType" then
+            local raw = safeCall(pb.readDataForUTI, nil, uti)
+            if type(raw) == "string" then
+                for url in raw:gmatch("file://[^\0\r\n]+") do
+                    appendUnique(files, fileURLToPath(url))
+                end
+            end
+        end
+    end
+
+    return files
 end
 
 local function looksLikeURL(text)
@@ -223,6 +287,38 @@ local function startTask(path, args)
     return true
 end
 
+local function saveImageCache(image)
+    if not image then return nil end
+    local path = uniquePath(CACHE_DIR .. "/Clipboard Image " .. timestamp() .. ".png")
+    if image:saveToFile(path, true, "PNG") then return path end
+    return nil
+end
+
+local function serializeEntry(item)
+    if not item then return nil end
+    return {
+        kind = item.kind,
+        title = item.title,
+        subtitle = item.subtitle,
+        text = item.text,
+        urls = item.urls or {},
+        files = item.files or {},
+        imageFile = item.imageFile,
+        types = item.types or {},
+        signature = item.signature,
+        created = item.created,
+    }
+end
+
+local function saveHistory()
+    local stored = {}
+    for _, item in ipairs(history) do
+        local serial = serializeEntry(item)
+        if serial then table.insert(stored, serial) end
+    end
+    hs.settings.set(SETTINGS_KEY, stored)
+end
+
 local function signatureFor(data, types, text, urls)
     local parts = {}
     for _, uti in ipairs(sortedKeys(data or {})) do
@@ -259,13 +355,8 @@ local function makeEntryFromPasteboard()
     local text = normalizeText(safeCall(pb.readString))
     local image = safeCall(pb.readImage)
     local styledText = safeCall(pb.readStyledText)
-    local urls = asList(safeCall(pb.readURL, nil, true))
-    local files = {}
-
-    for _, url in ipairs(urls) do
-        local path = fileURLToPath(url)
-        if path then table.insert(files, path) end
-    end
+    local urls = asList(safeCall(pb.readURL, true) or safeCall(pb.readURL))
+    local files = extractFiles(types, urls)
 
     local kind = "text"
     if #files > 0 then
@@ -286,6 +377,7 @@ local function makeEntryFromPasteboard()
     local title = "Clipboard Item"
     local subtitle = "Pasteboard item"
     local imageURL = nil
+    local imageFile = nil
 
     if kind == "file" then
         title = #files == 1 and (files[1]:match("[^/]+$") or files[1]) or tostring(#files) .. " files"
@@ -295,6 +387,7 @@ local function makeEntryFromPasteboard()
         title = "Image"
         subtitle = size and string.format("%dx%d image", size.w, size.h) or "Image"
         imageURL = image and image:encodeAsURLString(true, "PNG") or nil
+        imageFile = saveImageCache(image)
     elseif kind == "richtext" then
         title = text and clip(oneLine(text), 96) or "Rich text"
         subtitle = hasUTI(types, { ["public.html"] = true }) and "HTML rich text" or "Rich text"
@@ -323,6 +416,7 @@ local function makeEntryFromPasteboard()
         styledText = styledText,
         image = image,
         imageURL = imageURL,
+        imageFile = imageFile,
         urls = urls,
         files = files,
         types = types,
@@ -337,14 +431,24 @@ local function normalizeHistory()
         local item = history[i]
         if type(item) == "string" then
             history[i] = makeEntryFromText(item)
-        elseif type(item) == "table" and not item.signature then
-            item.signature = signatureFor(item.data, item.types, item.text, item.urls)
+        elseif type(item) == "table" then
+            item.urls = item.urls or {}
+            item.files = item.files or {}
+            item.types = item.types or {}
+            if item.kind == "image" and item.imageFile and not item.image then
+                item.image = hs.image.imageFromPath(item.imageFile)
+                item.imageURL = item.image and item.image:encodeAsURLString(true, "PNG") or nil
+            end
+            if not item.signature then
+                item.signature = signatureFor(item.data, item.types, item.text, item.urls)
+            end
         end
         if not history[i] then table.remove(history, i) end
     end
 end
 
 normalizeHistory()
+saveHistory()
 
 local function itemSearchText(item)
     return table.concat({
@@ -397,6 +501,7 @@ local function pushEntry(item)
 
     table.insert(history, 1, item)
     while #history > MAX_ITEMS do table.remove(history) end
+    saveHistory()
 end
 
 local function restoreClipboard(item)
@@ -408,15 +513,19 @@ local function restoreClipboard(item)
     if item.kind == "file" and #(item.files or {}) > 0 then
         local urls = {}
         for _, file in ipairs(item.files) do
-            table.insert(urls, hs.sharing.fileURL(file))
+            if hs.fs.attributes(file) then table.insert(urls, hs.sharing.fileURL(file)) end
         end
-        return pb.writeObjects(urls)
+        if #urls == 0 then return false end
+        return safeCall(pb.writeObjects, urls) == true
     elseif item.kind == "image" and item.image then
-        return pb.writeObjects(item.image)
+        return safeCall(pb.writeObjects, item.image) == true
+    elseif item.kind == "image" and item.imageFile then
+        local image = hs.image.imageFromPath(item.imageFile)
+        return image and safeCall(pb.writeObjects, image) == true or false
     elseif item.kind == "url" and (item.urls[1] or item.text) then
-        return pb.writeObjects(hs.sharing.URL(item.urls[1] or item.text))
+        return pb.setContents(item.urls[1] or item.text)
     elseif item.kind == "richtext" and item.styledText then
-        return pb.writeObjects(item.styledText)
+        return safeCall(pb.writeObjects, item.styledText) == true
     elseif item.kind == "richtext" and item.text then
         return pb.setContents(item.text)
     elseif item.text then
@@ -607,6 +716,7 @@ local function deleteSelected()
     local idx = selectedHistoryIndex()
     if not idx then return end
     table.remove(history, idx)
+    saveHistory()
     actionStatus("Deleted entry.")
 end
 
@@ -614,6 +724,7 @@ local function clearHistory()
     for i = #history, 1, -1 do table.remove(history, i) end
     selected = 1
     query = ""
+    saveHistory()
     actionStatus("Cleared clipboard history.")
 end
 
@@ -693,20 +804,22 @@ local function renderDetail(item)
 
     if detailMode == "preview" then
         return string.format(
-            '<section class="detail mode-enter"><div class="detail-title">%s</div>%s</section>',
+            '<section class="detail"><div class="detail-title">%s</div>%s</section>',
             htmlEscape(item and item.title or "Preview"),
             previewHTML(item)
         )
     end
 
     local status = statusText ~= "" and '<div class="status">' .. htmlEscape(statusText) .. '</div>' or ""
-    return '<section class="detail mode-enter"><div class="detail-title">Actions</div>' .. status .. '<div class="actions">' .. actionRows() .. '</div></section>'
+    return '<section class="detail"><div class="detail-title">Actions</div>' .. status .. '<div class="actions">' .. actionRows() .. '</div></section>'
 end
 
 local function dragPayload(item)
     if not item then return "" end
     if item.kind == "file" and item.files[1] then return item.urls[1] or pathToFileURL(item.files[1]) end
-    if item.kind == "image" and item.imageURL then return item.imageURL end
+    -- Finder turns dragged data:image URLs into text files, so image drags must
+    -- advertise the cached PNG file that was created when the item was captured.
+    if item.kind == "image" and item.imageFile then return pathToFileURL(item.imageFile) end
     if item.kind == "url" then return item.urls[1] or item.text or "" end
     return item.text or item.title or ""
 end
@@ -799,12 +912,6 @@ html, body {
   color: var(--text);
   box-shadow: 0 24px 80px rgba(0, 0, 0, 0.28);
   backdrop-filter: saturate(180%) blur(28px);
-  animation: panelIn 130ms ease-out both;
-}
-
-@keyframes panelIn {
-  from { opacity: 0; transform: translateY(5px) scale(0.992); }
-  to { opacity: 1; transform: translateY(0) scale(1); }
 }
 
 .sidebar {
@@ -943,15 +1050,6 @@ html, body {
   overflow: hidden;
 }
 
-.mode-enter {
-  animation: detailIn 120ms ease-out both;
-}
-
-@keyframes detailIn {
-  from { opacity: 0; transform: translateY(3px); }
-  to { opacity: 1; transform: translateY(0); }
-}
-
 .detail-title {
   margin-bottom: 16px;
   overflow: hidden;
@@ -1088,6 +1186,7 @@ end
 local function hidePanel()
     panelVisible = false
     draggingPanel = false
+    panelHasInput = false
     if _G.clipboardMgrKeyTap then _G.clipboardMgrKeyTap:stop() end
     if _G.clipboardMgrMouseTap then _G.clipboardMgrMouseTap:stop() end
     if _G.clipboardMgrWebview then
@@ -1137,6 +1236,7 @@ local function showPanel()
     detailMode = nil
     statusText = ""
     panelFrameCache = nil
+    panelHasInput = true
     buildPanel()
     panelFrameCache = panelFrame()
     _G.clipboardMgrWebview:frame(panelFrameCache)
@@ -1150,116 +1250,131 @@ end
 local lastChange = pb.changeCount()
 
 _G.clipboardMgrTimer = hs.timer.doEvery(POLL, function()
-    local c = pb.changeCount()
-    if c == lastChange then return end
-    lastChange = c
+    guarded("capture", function()
+        local c = pb.changeCount()
+        if c == lastChange then return end
+        lastChange = c
 
-    pushEntry(makeEntryFromPasteboard())
-    if panelVisible then renderPanel() end
+        pushEntry(makeEntryFromPasteboard())
+        if panelVisible then renderPanel() end
+    end)
 end):start()
 
 _G.clipboardMgrKeyTap = eventtap.new({ eventtap.event.types.keyDown }, function(e)
-    if not panelVisible then return false end
+    return guarded("key handler", function()
+        if not panelVisible then return false end
 
-    local key = keycodes.map[e:getKeyCode()]
-    local flags = e:getFlags()
-    local hasCommand = flags.cmd or flags.ctrl or flags.alt
-    local item = selectedItem()
+        local key = keycodes.map[e:getKeyCode()]
+        local flags = e:getFlags()
+        local hasCommand = flags.cmd or flags.ctrl or flags.alt
+        local item = selectedItem()
 
-    if key == "v" and hasHyper(flags) then
-        hidePanel()
-        return true
-    elseif key == "escape" then
-        hidePanel()
-        return true
-    elseif key == "down" then
-        moveSelection(1)
-        return true
-    elseif key == "up" then
-        moveSelection(-1)
-        return true
-    elseif key == "pagedown" then
-        moveSelection(7)
-        return true
-    elseif key == "pageup" then
-        moveSelection(-7)
-        return true
-    elseif key == "home" then
-        selected = 1
-        statusText = ""
-        renderPanel()
-        return true
-    elseif key == "end" then
-        updateFiltered()
-        selected = math.max(1, #filtered)
-        statusText = ""
-        renderPanel()
-        return true
-    elseif key == "return" and flags.cmd then
-        pasteItem(item, true)
-        renderPanel()
-        return true
-    elseif key == "return" then
-        pasteItem(item, false)
-        return true
-    elseif key == "space" then
-        detailMode = detailMode == "preview" and nil or "preview"
-        statusText = ""
-        renderPanel()
-        return true
-    elseif key == "c" and flags.cmd then
-        copyItem(item)
-        renderPanel()
-        return true
-    elseif key == "s" and flags.cmd then
-        saveItem(item)
-        renderPanel()
-        return true
-    elseif key == "y" and flags.cmd then
-        quickLookItem(item)
-        renderPanel()
-        return true
-    elseif key == "o" and flags.cmd then
-        openItem(item)
-        renderPanel()
-        return true
-    elseif key == "r" and flags.cmd then
-        revealItem(item)
-        renderPanel()
-        return true
-    elseif key == "delete" and flags.cmd and flags.shift then
-        clearHistory()
-        renderPanel()
-        return true
-    elseif key == "delete" and flags.cmd then
-        deleteSelected()
-        renderPanel()
-        return true
-    elseif key == "delete" then
-        query = dropLastChar(query)
-        selected = 1
-        statusText = ""
-        renderPanel()
-        return true
-    end
+        if key == "v" and hasHyper(flags) then
+            hidePanel()
+            return true
+        end
 
-    if not hasCommand then
-        local ch = e:getCharacters(true)
-        if ch == "?" or ch == "/" then
-            detailMode = "help"
+        -- The panel intentionally floats while users work elsewhere. Once a
+        -- click lands outside it, shortcuts like Cmd+C must pass through so new
+        -- clipboard items can still be captured while the manager is visible.
+        if not panelHasInput then return false end
+
+        if key == "escape" then
+            hidePanel()
+            return true
+        elseif key == "down" then
+            moveSelection(1)
+            return true
+        elseif key == "up" then
+            moveSelection(-1)
+            return true
+        elseif key == "pagedown" then
+            moveSelection(7)
+            return true
+        elseif key == "pageup" then
+            moveSelection(-7)
+            return true
+        elseif key == "home" then
+            selected = 1
             statusText = ""
             renderPanel()
             return true
-        elseif ch and ch ~= "" and ch:match("%C") then
-            query = query .. ch
+        elseif key == "end" then
+            updateFiltered()
+            selected = math.max(1, #filtered)
+            statusText = ""
+            renderPanel()
+            return true
+        elseif key == "return" and flags.cmd then
+            pasteItem(item, true)
+            renderPanel()
+            return true
+        elseif key == "return" then
+            pasteItem(item, false)
+            return true
+        elseif key == "space" then
+            if item and item.kind == "image" then
+                quickLookItem(item)
+            else
+                detailMode = detailMode == "preview" and nil or "preview"
+                statusText = ""
+                renderPanel()
+            end
+            return true
+        elseif key == "c" and flags.cmd then
+            copyItem(item)
+            renderPanel()
+            return true
+        elseif key == "s" and flags.cmd then
+            saveItem(item)
+            renderPanel()
+            return true
+        elseif key == "y" and flags.cmd then
+            quickLookItem(item)
+            renderPanel()
+            return true
+        elseif key == "o" and flags.cmd then
+            openItem(item)
+            renderPanel()
+            return true
+        elseif key == "r" and flags.cmd then
+            revealItem(item)
+            renderPanel()
+            return true
+        elseif key == "delete" and flags.cmd and flags.shift then
+            clearHistory()
+            renderPanel()
+            return true
+        elseif key == "delete" and flags.cmd then
+            deleteSelected()
+            renderPanel()
+            return true
+        elseif key == "delete" then
+            query = dropLastChar(query)
             selected = 1
             statusText = ""
             renderPanel()
             return true
         end
-    end
 
-    return true
+        if not hasCommand then
+            local ch = e:getCharacters(true)
+            if ch == "?" or ch == "/" then
+                detailMode = detailMode == "help" and nil or "help"
+                statusText = ""
+                renderPanel()
+                return true
+            elseif ch and ch ~= "" and ch:match("%C") then
+                query = query .. ch
+                selected = 1
+                statusText = ""
+                renderPanel()
+                return true
+            end
+        end
+
+        return true
+    end, true)
 end)
 
 local function isPointInFrame(point, frame)
@@ -1270,7 +1385,7 @@ end
 local function isInDragHandle(point, frame)
     return isPointInFrame(point, frame)
         and point.y >= frame.y
-        and point.y <= frame.y + QUERY_H
+        and point.y <= frame.y + QUERY_H + 8
 end
 
 _G.clipboardMgrMouseTap = eventtap.new({
@@ -1280,18 +1395,27 @@ _G.clipboardMgrMouseTap = eventtap.new({
 }, function(e)
     if not panelVisible or not _G.clipboardMgrWebview then return false end
 
-    local point = hs.mouse.absolutePosition()
+    local point = e:location()
     local frame = panelFrameCache or _G.clipboardMgrWebview:frame()
     local flags = e:getFlags()
     local eventType = e:getType()
 
     if eventType == eventtap.event.types.leftMouseDown then
-        if isPointInFrame(point, frame) and (flags.cmd or isInDragHandle(point, frame)) then
+        if not isPointInFrame(point, frame) then
+            panelHasInput = false
+            return false
+        end
+
+        panelHasInput = true
+        if flags.cmd or isInDragHandle(point, frame) then
             draggingPanel = true
             dragStartMouse = point
             dragStartFrame = frame
             return true
         end
+
+        -- Row drags need to remain native WebKit drags so users can drop items
+        -- into Finder/apps without removing them from clipboard history.
         return false
     elseif eventType == eventtap.event.types.leftMouseDragged then
         if draggingPanel and dragStartMouse and dragStartFrame then
