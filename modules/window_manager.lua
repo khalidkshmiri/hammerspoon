@@ -121,6 +121,36 @@ local function boundsOnScreen(screen, w, h)
     return sf.x - w + MIN_VISIBLE_X, sf.x + sf.w - MIN_VISIBLE_X, sf.y, sf.y + sf.h - MIN_VISIBLE_Y
 end
 
+local function screenRect(screen)
+    local sf = screen:frame()
+    return {
+        left = sf.x,
+        right = sf.x + sf.w,
+        top = sf.y,
+        bottom = sf.y + sf.h,
+    }
+end
+
+local function resizeBounds(originScreen, pointerScreen)
+    local origin = screenRect(originScreen)
+    local bounds = {
+        left = origin.left,
+        right = origin.right,
+        top = origin.top,
+        bottom = origin.bottom,
+    }
+
+    if pointerScreen and pointerScreen ~= originScreen then
+        local target = screenRect(pointerScreen)
+        if target.left < origin.left then bounds.left = target.left end
+        if target.right > origin.right then bounds.right = target.right end
+        if target.top < origin.top then bounds.top = target.top end
+        if target.bottom > origin.bottom then bounds.bottom = target.bottom end
+    end
+
+    return bounds
+end
+
 -- Returns true if the window's current frame is still at the position we maximized it to.
 local function withAnimation(fn)
     hs.window.animationDuration = ANIMATE_DURATION
@@ -142,7 +172,7 @@ local function doMaximize(win, winId, currentF)
     win:focus()
 end
 
-local function resizedFrame(initF, edges, dx, dy)
+local function resizedFrame(initF, edges, dx, dy, originScreen, pointerScreen)
     local newX, newY, newW, newH = initF.x, initF.y, initF.w, initF.h
     if edges.left then
         newW = max(MIN_WIN_W, initF.w - dx)
@@ -156,14 +186,58 @@ local function resizedFrame(initF, edges, dx, dy)
     elseif edges.bottom then
         newH = max(MIN_WIN_H, initF.h + dy)
     end
-    return { x = newX, y = newY, w = newW, h = newH }
+
+    if not originScreen then
+        return { x = newX, y = newY, w = newW, h = newH }
+    end
+
+    local bounds = resizeBounds(originScreen, pointerScreen)
+    local left = newX
+    local right = newX + newW
+    local top = newY
+    local bottom = newY + newH
+
+    if edges.left then
+        left = max(bounds.left, left)
+        left = min(left, right - MIN_WIN_W)
+    elseif edges.right then
+        right = min(bounds.right, right)
+        right = max(right, left + MIN_WIN_W)
+    end
+
+    if edges.top then
+        top = max(bounds.top, top)
+        top = min(top, bottom - MIN_WIN_H)
+    elseif edges.bottom then
+        bottom = min(bounds.bottom, bottom)
+        bottom = max(bottom, top + MIN_WIN_H)
+    end
+
+    return {
+        x = left,
+        y = top,
+        w = right - left,
+        h = bottom - top,
+    }
 end
 
 local function flushResize(state)
-    pcall(state.window.setFrame, state.window, resizedFrame(state.initFrame, state.edges, state.totalDX, state.totalDY))
+    pcall(
+        state.window.setFrame,
+        state.window,
+        resizedFrame(
+            state.initFrame,
+            state.edges,
+            state.totalDX,
+            state.totalDY,
+            state.originScreen,
+            state.pointerScreen
+        )
+    )
 end
 
 local function newResizeState(win, frame, edges, pos)
+    local originScreen = win:screen()
     local state = {
         window = win,
         isResize = true,
@@ -171,6 +245,8 @@ local function newResizeState(win, frame, edges, pos)
         didDrag = false,
         edges = edges,
         initFrame = frame,
+        originScreen = originScreen,
+        pointerScreen = originScreen,
         initMouseX = pos.x,
         initMouseY = pos.y,
         totalDX = 0,
@@ -337,6 +413,7 @@ _G.windowDragger = hs.eventtap.new({ EV_DOWN, EV_DRAG, EV_UP, EV_RDOWN, EV_RDRAG
             local curPos = event:location()
             dragState.totalDX = curPos.x - dragState.initMouseX
             dragState.totalDY = curPos.y - dragState.initMouseY
+            dragState.pointerScreen = screenForPoint(curPos)
             dragState.dirty   = true
             return true
         end
@@ -444,6 +521,7 @@ _G.windowDragger = hs.eventtap.new({ EV_DOWN, EV_DRAG, EV_UP, EV_RDOWN, EV_RDRAG
         local curPos      = event:location()
         dragState.totalDX = curPos.x - dragState.initMouseX
         dragState.totalDY = curPos.y - dragState.initMouseY
+        dragState.pointerScreen = screenForPoint(curPos)
         dragState.dirty   = true
         return true
 
@@ -474,9 +552,12 @@ _G.windowDragger = hs.eventtap.new({ EV_DOWN, EV_DRAG, EV_UP, EV_RDOWN, EV_RDRAG
         -- Edges are locked so the resize direction can't flip as the window grows/shrinks.
         if not scrollTarget.win then
             local f = win:frame()
+            local originScreen = win:screen()
             scrollTarget.win = win
             scrollTarget.edges = quadrantEdges(pos, f)
             scrollTarget.initFrame = { x = f.x, y = f.y, w = f.w, h = f.h }
+            scrollTarget.originScreen = originScreen
+            scrollTarget.pointerScreen = originScreen
             scrollTarget.totalDX = 0
             scrollTarget.totalDY = 0
             scrollTarget.dirty = false
@@ -493,6 +574,7 @@ _G.windowDragger = hs.eventtap.new({ EV_DOWN, EV_DRAG, EV_UP, EV_RDOWN, EV_RDRAG
         -- Accumulate total scroll delta from the initial frame — the timer reads this.
         scrollTarget.totalDX = scrollTarget.totalDX + dx * SCROLL_RESIZE_SPEED
         scrollTarget.totalDY = scrollTarget.totalDY + dy * SCROLL_RESIZE_SPEED
+        scrollTarget.pointerScreen = screenForPoint(pos)
         scrollTarget.dirty   = true
 
         -- Reset the release timer; on expiry stop the update timer and clean up.
