@@ -3,6 +3,9 @@ package.loaded["modules.brightness_manager"] = nil
 if _G.brightnessCaffeinateWatcher then _G.brightnessCaffeinateWatcher:stop() end
 if _G.brightnessScreenWatcher then _G.brightnessScreenWatcher:stop() end
 if _G.brightnessApplyTimer then _G.brightnessApplyTimer:stop() end
+if _G.brightnessPeriodTimers then
+    for _, t in ipairs(_G.brightnessPeriodTimers) do t:stop() end
+end
 
 local BUILTIN_NAMES = { ["Built-in Retina Display"] = true, ["Color LCD"] = true }
 local BETTERDISPLAY = "/Applications/BetterDisplay.app/Contents/MacOS/BetterDisplay"
@@ -160,5 +163,16 @@ end):start()
 _G.brightnessScreenWatcher = hs.screen.watcher.new(function()
     scheduleApply(false)
 end):start()
+
+-- Re-apply at each period boundary so brightness tracks day→evening→night even when
+-- the Mac stays awake — the watchers above only fire on wake/unlock/screen change.
+-- respectManual=true is safe here: at a boundary the period has changed, so applyBrightness
+-- overrides regardless; within a period it still leaves manual adjustments alone.
+-- Boundaries mirror currentPeriod() above (07:00 day, 18:00 evening, 21:30 night).
+_G.brightnessPeriodTimers = {}
+for _, boundary in ipairs({ "07:00", "18:00", "21:30" }) do
+    _G.brightnessPeriodTimers[#_G.brightnessPeriodTimers + 1] =
+        hs.timer.doAt(boundary, "1d", function() scheduleApply(true) end)
+end
 
 scheduleApply(false)
