@@ -33,6 +33,7 @@ local MIN_VISIBLE_Y         = 30   -- min px of window height that must remain o
 local dragState   = {}
 local dragGen     = 0
 local lastClick   = { time = 0, winId = nil }
+local pendingPlainDrag = nil
 -- Scroll gesture target: locked when a scroll starts, released 0.3s after last event.
 -- The event tap only accumulates deltas; a 60fps timer flushes them to setFrame so
 -- the tap never blocks on slow-to-resize apps (Xcode, Reminders).
@@ -135,6 +136,13 @@ local function isStillMaximized(winId, currentF)
            math.abs(currentF.w - m.w) < 5 and math.abs(currentF.h - m.h) < 5
 end
 
+local function inPlainTitleZone(pos, f)
+    return pos.y >= f.y
+       and pos.y <= f.y + TITLE_BAR_HEIGHT
+       and pos.x >  f.x + WINDOW_CONTROLS_WIDTH
+       and pos.x <  f.x + f.w - RESIZE_MARGIN
+end
+
 local function doMaximize(win, winId, currentF)
     local maxF = win:screen():frame()
     savedFrames[winId] = { pre = currentF, max = maxF }
@@ -204,6 +212,7 @@ _G.windowDragger = hs.eventtap.new({ EV_DOWN, EV_DRAG, EV_UP, EV_RDOWN, EV_RDRAG
     -- ── Mouse down ───────────────────────────────────────────────────────────
     if eventType == EV_DOWN then
         dragState = {}
+        pendingPlainDrag = nil
         local hasHyper = isHyper()
         -- Fallback for the race after a space switch: macOS emits flagsChanged during the
         -- transition which resets hyperActive to false, but the event's own flags still
@@ -237,10 +246,7 @@ _G.windowDragger = hs.eventtap.new({ EV_DOWN, EV_DRAG, EV_UP, EV_RDOWN, EV_RDRAG
             -- Native double-click on the title bar → same maximize/restore as
             -- Hyper+double-click, replacing macOS' default zoom/minimize. Applies to
             -- any window, not just ones we previously maximized.
-            local inTitleZone = pos.y >= f.y
-                            and pos.y <= f.y + TITLE_BAR_HEIGHT
-                            and pos.x >  f.x + WINDOW_CONTROLS_WIDTH
-                            and pos.x <  f.x + f.w - RESIZE_MARGIN
+            local inTitleZone = inPlainTitleZone(pos, f)
             if clickState == 2 and inTitleZone then
                 lastClick = { time = 0, winId = nil }
                 if isStillMaximized(winId, f) then
@@ -255,14 +261,13 @@ _G.windowDragger = hs.eventtap.new({ EV_DOWN, EV_DRAG, EV_UP, EV_RDOWN, EV_RDRAG
 
             local inTitleBar = savedFrames[winId]
                            and isStillMaximized(winId, f)
-                           and pos.y >= f.y
-                           and pos.y <= f.y + TITLE_BAR_HEIGHT
-                           and pos.x >  f.x + WINDOW_CONTROLS_WIDTH
-                           and pos.x <  f.x + f.w - RESIZE_MARGIN
+                           and inPlainTitleZone(pos, f)
             if not inTitleBar then return end
 
             local minX, maxX, minY, maxY = boundsOnScreen(win:screen(), f.w, f.h)
-            dragState = {
+            -- Plain top-bar clicks must pass through: app toolbars and native buttons live
+            -- in this strip. We only take over after the click becomes an actual drag.
+            pendingPlainDrag = {
                 window     = win,
                 x = f.x,   y = f.y,
                 w = f.w,   h = f.h,
@@ -273,7 +278,7 @@ _G.windowDragger = hs.eventtap.new({ EV_DOWN, EV_DRAG, EV_UP, EV_RDOWN, EV_RDRAG
                 didDrag    = false,
                 savedFrame = savedFrames[winId].pre,
             }
-            return true
+            return false
         end
 
         -- ── Hyper held: resize / double-click / drag ──────────────────────────
@@ -324,6 +329,10 @@ _G.windowDragger = hs.eventtap.new({ EV_DOWN, EV_DRAG, EV_UP, EV_RDOWN, EV_RDRAG
 
     -- ── Mouse drag ───────────────────────────────────────────────────────────
     elseif eventType == EV_DRAG then
+        if pendingPlainDrag and not dragState.window then
+            dragState = pendingPlainDrag
+            pendingPlainDrag = nil
+        end
         if not dragState.window then return end
         dragState.didDrag = true
 
@@ -401,6 +410,10 @@ _G.windowDragger = hs.eventtap.new({ EV_DOWN, EV_DRAG, EV_UP, EV_RDOWN, EV_RDRAG
 
     -- ── Mouse up ─────────────────────────────────────────────────────────────
     elseif eventType == EV_UP then
+        if pendingPlainDrag then
+            pendingPlainDrag = nil
+            return false
+        end
         if dragState.window then
             stopResize(dragState)
             if dragState.isCmdDrag then
