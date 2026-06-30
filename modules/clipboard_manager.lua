@@ -1,55 +1,100 @@
 package.loaded["modules.clipboard_manager"] = nil
 
--- Lightweight clipboard history. Text-only and in-memory on purpose; images,
--- rich text, and blob caches turn a tiny helper into a memory sink quickly.
+-- Clipboard history with a native macOS-style panel. The history keeps raw
+-- pasteboard representations where Hammerspoon exposes them, so pasting/copying
+-- can preserve files, images, URLs, RTF/HTML, and plain text instead of flattening
+-- everything into strings.
 
 if _G.clipboardMgrTimer  then _G.clipboardMgrTimer:stop() end
 if _G.clipboardMgrHotkey then _G.clipboardMgrHotkey:delete() end
 if _G.clipboardMgrChooser then _G.clipboardMgrChooser:delete() end
 if _G.clipboardMgrKeyTap then _G.clipboardMgrKeyTap:stop() end
+if _G.clipboardMgrMouseTap then _G.clipboardMgrMouseTap:stop() end
 if _G.clipboardMgrWebview then _G.clipboardMgrWebview:delete() end
 
 local pb       = hs.pasteboard
 local webview  = hs.webview
 local eventtap = hs.eventtap
 local keycodes = hs.keycodes
+local task     = hs.task
 
 local MAX_ITEMS = 50
 local POLL      = 0.5
 local HYPER     = { "cmd", "ctrl", "alt", "shift" }
 
-local PANEL_W = 920
-local PANEL_H = 540
-local VISIBLE_ROWS = 7
+local PANEL_W = 680
+local PANEL_H = 430
+local DETAIL_W = 980
+local VISIBLE_ROWS = 8
+local QUERY_H = 58
 
-local history = _G.clipboardMgrHistory or {}
+local RICH_UTIS = {
+    ["public.rtf"] = true,
+    ["public.html"] = true,
+    ["com.apple.webarchive"] = true,
+    ["public.rtfd"] = true,
+    ["com.apple.flat-rtfd"] = true,
+}
+
+local IMAGE_UTIS = {
+    ["public.png"] = true,
+    ["public.tiff"] = true,
+    ["public.jpeg"] = true,
+    ["public.heic"] = true,
+    ["com.apple.icns"] = true,
+}
+
+local MARKDOWN_UTIS = {
+    ["net.daringfireball.markdown"] = true,
+    ["public.markdown"] = true,
+    ["text/markdown"] = true,
+}
+
+local rawHistory = _G.clipboardMgrHistory or {}
+local history = rawHistory
 _G.clipboardMgrHistory = history
+_G.clipboardMgrTasks = _G.clipboardMgrTasks or {}
 
 local query = ""
 local selected = 1
 local filtered = {}
 local panelVisible = false
+local detailMode = nil
+local statusText = ""
+local previousWindow = nil
+local draggingPanel = false
+local dragStartMouse = nil
+local dragStartFrame = nil
+local panelFrameCache = nil
+local renderPanel
 
 local function oneLine(s)
     return (s:gsub("%s+", " "):gsub("^%s+", ""):gsub("%s+$", ""))
 end
 
 local function normalizeText(s)
+    if not s then return nil end
     s = s:gsub("\r\n", "\n"):gsub("\r", "\n")
     return (s:gsub("^%s+", ""):gsub("%s+$", ""))
 end
 
 local function clip(s, n)
+    if not s then return "" end
     if #s > n then return s:sub(1, n) .. "..." end
     return s
 end
 
 local function htmlEscape(s)
+    s = tostring(s or "")
     return (s:gsub("&", "&amp;")
              :gsub("<", "&lt;")
              :gsub(">", "&gt;")
              :gsub('"', "&quot;")
              :gsub("'", "&#39;"))
+end
+
+local function cssEscape(s)
+    return htmlEscape(s):gsub("\n", " ")
 end
 
 local function dropLastChar(s)
@@ -58,16 +103,275 @@ local function dropLastChar(s)
     return s:sub(1, -2)
 end
 
+local function hasUTI(types, lookup)
+    for _, uti in ipairs(types or {}) do
+        if lookup[uti] then return true end
+    end
+    return false
+end
+
+local function safeCall(fn, ...)
+    local ok, result = pcall(fn, ...)
+    if ok then return result end
+    return nil
+end
+
+local function setStatus(message)
+    statusText = message or ""
+    hs.timer.doAfter(1.2, function()
+        if statusText == message then
+            statusText = ""
+            if panelVisible then renderPanel() end
+        end
+    end)
+end
+
+local function hasHyper(flags)
+    return flags.cmd and flags.ctrl and flags.alt and flags.shift
+end
+
+local function asList(value)
+    if value == nil then return {} end
+    if type(value) == "table" then return value end
+    return { value }
+end
+
+local function sortedKeys(t)
+    local keys = {}
+    for k in pairs(t or {}) do table.insert(keys, k) end
+    table.sort(keys)
+    return keys
+end
+
+local function percentDecode(s)
+    return (s:gsub("%%(%x%x)", function(hex)
+        return string.char(tonumber(hex, 16))
+    end))
+end
+
+local function percentEncodePath(s)
+    return (s:gsub("([^%w%-%._~/])", function(c)
+        return string.format("%%%02X", string.byte(c))
+    end))
+end
+
+local function fileURLToPath(url)
+    if type(url) ~= "string" or not url:match("^file://") then return nil end
+    local path = url:gsub("^file://localhost", ""):gsub("^file://", "")
+    return percentDecode(path)
+end
+
+local function pathToFileURL(path)
+    if type(path) ~= "string" then return "" end
+    return "file://" .. percentEncodePath(path)
+end
+
+local function looksLikeURL(text)
+    return type(text) == "string" and text:match("^[%w+.-]+://%S+$") ~= nil
+end
+
+local function looksLikeMarkdown(text)
+    if type(text) ~= "string" then return false end
+    return text:match("\n#%s")
+        or text:match("^#%s")
+        or text:match("\n[-*+]%s")
+        or text:match("```")
+        or text:match("%[[^%]]+%]%([^%)]+%)")
+        or text:match("\n>%s")
+end
+
+local function desktopPath()
+    return (os.getenv("HOME") or "~") .. "/Desktop"
+end
+
+local function timestamp()
+    return os.date("%Y-%m-%d %H.%M.%S")
+end
+
+local function sanitizeFilename(name)
+    name = oneLine(tostring(name or "Clipboard Item"))
+    name = name:gsub("[/:]", "-"):gsub("[^%w%s%._%-]", "")
+    name = name:gsub("^%s+", ""):gsub("%s+$", "")
+    if name == "" then name = "Clipboard Item" end
+    return clip(name, 72)
+end
+
+local function uniquePath(path)
+    if not hs.fs.attributes(path) then return path end
+    local base, ext = path:match("^(.*)(%.[^%.]+)$")
+    if not base then base, ext = path, "" end
+    for i = 2, 99 do
+        local candidate = string.format("%s %d%s", base, i, ext)
+        if not hs.fs.attributes(candidate) then return candidate end
+    end
+    return path
+end
+
+local function writeFile(path, data)
+    local f = io.open(path, "wb")
+    if not f then return false end
+    f:write(data or "")
+    f:close()
+    return true
+end
+
+local function startTask(path, args)
+    local t = task.new(path, nil, nil, args)
+    if not t then return false end
+    table.insert(_G.clipboardMgrTasks, t)
+    t:start()
+    return true
+end
+
+local function signatureFor(data, types, text, urls)
+    local parts = {}
+    for _, uti in ipairs(sortedKeys(data or {})) do
+        local value = data[uti]
+        parts[#parts + 1] = uti .. ":" .. tostring(type(value) == "string" and #value or 0) .. ":" .. tostring(value):sub(1, 64)
+    end
+    for _, uti in ipairs(types or {}) do parts[#parts + 1] = "type:" .. uti end
+    for _, url in ipairs(urls or {}) do parts[#parts + 1] = "url:" .. url end
+    if text then parts[#parts + 1] = "text:" .. text:sub(1, 256) end
+    return table.concat(parts, "|")
+end
+
+local function makeEntryFromText(text)
+    text = normalizeText(text)
+    if not text or text == "" then return nil end
+    local kind = looksLikeURL(text) and "url" or (looksLikeMarkdown(text) and "markdown" or "text")
+    return {
+        kind = kind,
+        title = clip(oneLine(text), 96),
+        subtitle = kind == "markdown" and "Markdown text" or (kind == "url" and "URL" or "Plain text"),
+        text = text,
+        types = { "public.utf8-plain-text" },
+        data = { ["public.utf8-plain-text"] = text },
+        urls = kind == "url" and { text } or {},
+        files = {},
+        signature = "text:" .. text,
+        created = os.time(),
+    }
+end
+
+local function makeEntryFromPasteboard()
+    local types = safeCall(pb.contentTypes) or {}
+    local data = safeCall(pb.readAllData) or {}
+    local text = normalizeText(safeCall(pb.readString))
+    local image = safeCall(pb.readImage)
+    local styledText = safeCall(pb.readStyledText)
+    local urls = asList(safeCall(pb.readURL, nil, true))
+    local files = {}
+
+    for _, url in ipairs(urls) do
+        local path = fileURLToPath(url)
+        if path then table.insert(files, path) end
+    end
+
+    local kind = "text"
+    if #files > 0 then
+        kind = "file"
+    elseif image or hasUTI(types, IMAGE_UTIS) then
+        kind = "image"
+    elseif hasUTI(types, MARKDOWN_UTIS) or looksLikeMarkdown(text) then
+        kind = "markdown"
+    elseif hasUTI(types, RICH_UTIS) then
+        kind = "richtext"
+    elseif #urls > 0 or looksLikeURL(text) then
+        kind = "url"
+    end
+
+    if not text and kind == "url" and urls[1] then text = urls[1] end
+    if not text and kind == "file" then text = table.concat(files, "\n") end
+
+    local title = "Clipboard Item"
+    local subtitle = "Pasteboard item"
+    local imageURL = nil
+
+    if kind == "file" then
+        title = #files == 1 and (files[1]:match("[^/]+$") or files[1]) or tostring(#files) .. " files"
+        subtitle = table.concat(files, ", ")
+    elseif kind == "image" then
+        local size = image and image:size() or nil
+        title = "Image"
+        subtitle = size and string.format("%dx%d image", size.w, size.h) or "Image"
+        imageURL = image and image:encodeAsURLString(true, "PNG") or nil
+    elseif kind == "richtext" then
+        title = text and clip(oneLine(text), 96) or "Rich text"
+        subtitle = hasUTI(types, { ["public.html"] = true }) and "HTML rich text" or "Rich text"
+    elseif kind == "markdown" then
+        title = text and clip(oneLine(text), 96) or "Markdown"
+        subtitle = "Markdown text"
+    elseif kind == "url" then
+        title = text and clip(oneLine(text), 96) or (urls[1] or "URL")
+        subtitle = "URL"
+    elseif text and text ~= "" then
+        title = clip(oneLine(text), 96)
+        subtitle = "Plain text"
+    else
+        title = types[1] or "Clipboard Item"
+        subtitle = "Unsupported pasteboard data"
+    end
+
+    local sig = signatureFor(data, types, text, urls)
+    if sig == "" then return nil end
+
+    return {
+        kind = kind,
+        title = title,
+        subtitle = subtitle,
+        text = text,
+        styledText = styledText,
+        image = image,
+        imageURL = imageURL,
+        urls = urls,
+        files = files,
+        types = types,
+        data = data,
+        signature = sig,
+        created = os.time(),
+    }
+end
+
+local function normalizeHistory()
+    for i = #history, 1, -1 do
+        local item = history[i]
+        if type(item) == "string" then
+            history[i] = makeEntryFromText(item)
+        elseif type(item) == "table" and not item.signature then
+            item.signature = signatureFor(item.data, item.types, item.text, item.urls)
+        end
+        if not history[i] then table.remove(history, i) end
+    end
+end
+
+normalizeHistory()
+
+local function itemSearchText(item)
+    return table.concat({
+        item.title or "",
+        item.subtitle or "",
+        item.kind or "",
+        item.text or "",
+        table.concat(item.urls or {}, " "),
+        table.concat(item.files or {}, " "),
+    }, " "):lower()
+end
+
 local function selectedHistoryIndex()
     return filtered[selected]
+end
+
+local function selectedItem()
+    local idx = selectedHistoryIndex()
+    return idx and history[idx] or nil
 end
 
 local function updateFiltered()
     filtered = {}
     local q = query:lower()
 
-    for i, text in ipairs(history) do
-        if q == "" or text:lower():find(q, 1, true) or oneLine(text):lower():find(q, 1, true) then
+    for i, item in ipairs(history) do
+        if q == "" or itemSearchText(item):find(q, 1, true) then
             table.insert(filtered, i)
         end
     end
@@ -81,40 +385,336 @@ local function updateFiltered()
     end
 end
 
-local function pushText(text)
-    if not text or text == "" then return end
-    text = normalizeText(text)
-    if text == "" then return end
+local function pushEntry(item)
+    if not item then return end
 
-    for i, v in ipairs(history) do
-        if v == text then
+    for i, existing in ipairs(history) do
+        if existing.signature == item.signature then
             table.remove(history, i)
             break
         end
     end
 
-    table.insert(history, 1, text)
+    table.insert(history, 1, item)
     while #history > MAX_ITEMS do table.remove(history) end
 end
 
-local function itemMeta(text)
-    local lines = 1
-    for _ in text:gmatch("\n") do lines = lines + 1 end
-    if lines > 1 then return tostring(lines) .. " lines" end
-    return tostring(#text) .. " chars"
+local function restoreClipboard(item)
+    if not item then return false end
+
+    -- Prefer typed Cocoa objects for formats that broke when restored as raw UTI
+    -- blobs. Falling back to raw data is intentionally narrow so a failed complex
+    -- restore does not clear the pasteboard and poison future clipboard captures.
+    if item.kind == "file" and #(item.files or {}) > 0 then
+        local urls = {}
+        for _, file in ipairs(item.files) do
+            table.insert(urls, hs.sharing.fileURL(file))
+        end
+        return pb.writeObjects(urls)
+    elseif item.kind == "image" and item.image then
+        return pb.writeObjects(item.image)
+    elseif item.kind == "url" and (item.urls[1] or item.text) then
+        return pb.writeObjects(hs.sharing.URL(item.urls[1] or item.text))
+    elseif item.kind == "richtext" and item.styledText then
+        return pb.writeObjects(item.styledText)
+    elseif item.kind == "richtext" and item.text then
+        return pb.setContents(item.text)
+    elseif item.text then
+        return pb.setContents(item.text)
+    end
+    return false
+end
+
+local function actionStatus(message)
+    setStatus(message)
+end
+
+local function focusPreviousWindow()
+    if previousWindow and safeCall(function() return previousWindow:isStandard() end) then
+        previousWindow:focus()
+    end
+end
+
+local function postPasteForItem(item)
+    local mods = item and item.kind == "richtext" and { "cmd", "alt" } or { "cmd" }
+    if _G.clipboardMgrKeyTap then _G.clipboardMgrKeyTap:stop() end
+    focusPreviousWindow()
+    eventtap.keyStroke(mods, "v", 0)
+end
+
+local function pasteItem(item, keepOpen)
+    if not item or not restoreClipboard(item) then
+        actionStatus("Could not restore clipboard item.")
+        return
+    end
+
+    if keepOpen then
+        postPasteForItem(item)
+        hs.timer.doAfter(0.16, function()
+            if panelVisible and _G.clipboardMgrWebview then
+                _G.clipboardMgrWebview:bringToFront(false)
+                if _G.clipboardMgrKeyTap then _G.clipboardMgrKeyTap:start() end
+            end
+        end)
+    else
+        panelVisible = false
+        if _G.clipboardMgrKeyTap then _G.clipboardMgrKeyTap:stop() end
+        if _G.clipboardMgrWebview then _G.clipboardMgrWebview:hide(0.08) end
+        hs.timer.doAfter(0.04, function() postPasteForItem(item) end)
+    end
+end
+
+local function copyItem(item)
+    if restoreClipboard(item) then
+        actionStatus("Copied item to clipboard.")
+    else
+        actionStatus("Could not copy item.")
+    end
+end
+
+local function writeItemToTemporaryFile(item)
+    if not item then return nil end
+    local dir = hs.fs.temporaryDirectory() .. "/hammerspoon-clipboard"
+    hs.fs.mkdir(dir)
+    local path
+
+    if item.kind == "image" and item.image then
+        path = uniquePath(dir .. "/Clipboard Image " .. timestamp() .. ".png")
+        if item.image:saveToFile(path, true, "PNG") then return path end
+    elseif item.kind == "markdown" then
+        path = uniquePath(dir .. "/Clipboard Markdown " .. timestamp() .. ".md")
+        if writeFile(path, item.text or "") then return path end
+    elseif item.kind == "richtext" and item.data and item.data["public.rtf"] then
+        path = uniquePath(dir .. "/Clipboard Rich Text " .. timestamp() .. ".rtf")
+        if writeFile(path, item.data["public.rtf"]) then return path end
+    elseif item.kind == "richtext" and item.data and item.data["public.html"] then
+        path = uniquePath(dir .. "/Clipboard Rich Text " .. timestamp() .. ".html")
+        if writeFile(path, item.data["public.html"]) then return path end
+    else
+        path = uniquePath(dir .. "/Clipboard Text " .. timestamp() .. ".txt")
+        if writeFile(path, item.text or item.title or "") then return path end
+    end
+
+    return nil
+end
+
+local function saveItem(item)
+    if not item then return end
+    local base = desktopPath()
+    local path
+
+    if item.kind == "image" and item.image then
+        path = uniquePath(base .. "/" .. sanitizeFilename(item.title) .. " " .. timestamp() .. ".png")
+        if item.image:saveToFile(path, true, "PNG") then
+            actionStatus("Saved image to Desktop.")
+        else
+            actionStatus("Could not save image.")
+        end
+    elseif item.kind == "file" and #item.files > 0 then
+        local folder = uniquePath(base .. "/Clipboard Files " .. timestamp())
+        hs.fs.mkdir(folder)
+        local args = { "-R" }
+        for _, file in ipairs(item.files) do table.insert(args, file) end
+        table.insert(args, folder)
+        if startTask("/bin/cp", args) then
+            actionStatus("Copying files to Desktop.")
+        else
+            actionStatus("Could not start file copy.")
+        end
+    elseif item.kind == "url" then
+        path = uniquePath(base .. "/" .. sanitizeFilename(item.title) .. ".url")
+        if writeFile(path, item.text or item.urls[1] or "") then
+            actionStatus("Saved URL to Desktop.")
+        else
+            actionStatus("Could not save URL.")
+        end
+    elseif item.kind == "markdown" then
+        path = uniquePath(base .. "/" .. sanitizeFilename(item.title) .. ".md")
+        if writeFile(path, item.text or "") then
+            actionStatus("Saved Markdown to Desktop.")
+        else
+            actionStatus("Could not save Markdown.")
+        end
+    elseif item.kind == "richtext" and item.data and item.data["public.rtf"] then
+        path = uniquePath(base .. "/" .. sanitizeFilename(item.title) .. ".rtf")
+        if writeFile(path, item.data["public.rtf"]) then
+            actionStatus("Saved rich text to Desktop.")
+        else
+            actionStatus("Could not save rich text.")
+        end
+    elseif item.kind == "richtext" and item.data and item.data["public.html"] then
+        path = uniquePath(base .. "/" .. sanitizeFilename(item.title) .. ".html")
+        if writeFile(path, item.data["public.html"]) then
+            actionStatus("Saved HTML to Desktop.")
+        else
+            actionStatus("Could not save HTML.")
+        end
+    else
+        path = uniquePath(base .. "/" .. sanitizeFilename(item.title) .. ".txt")
+        if writeFile(path, item.text or item.title or "") then
+            actionStatus("Saved text to Desktop.")
+        else
+            actionStatus("Could not save text.")
+        end
+    end
+end
+
+local function quickLookItem(item)
+    if not item then return end
+    local files = item.kind == "file" and item.files or nil
+    if not files or #files == 0 then
+        local temp = writeItemToTemporaryFile(item)
+        files = temp and { temp } or {}
+    end
+
+    if #files == 0 then
+        actionStatus("Nothing to Quick Look.")
+        return
+    end
+
+    local args = { "-p" }
+    for _, file in ipairs(files) do table.insert(args, file) end
+    if startTask("/usr/bin/qlmanage", args) then
+        actionStatus("Opened Quick Look.")
+    else
+        actionStatus("Could not start Quick Look.")
+    end
+end
+
+local function openItem(item)
+    if not item then return end
+    if item.kind == "file" and item.files[1] then
+        startTask("/usr/bin/open", item.files)
+        actionStatus("Opened file.")
+    elseif item.kind == "url" and (item.urls[1] or item.text) then
+        hs.urlevent.openURL(item.urls[1] or item.text)
+        actionStatus("Opened URL.")
+    else
+        actionStatus("Open is available for files and URLs.")
+    end
+end
+
+local function revealItem(item)
+    if not item or item.kind ~= "file" or not item.files[1] then
+        actionStatus("Reveal is available for files.")
+        return
+    end
+    startTask("/usr/bin/open", { "-R", item.files[1] })
+    actionStatus("Revealed in Finder.")
+end
+
+local function deleteSelected()
+    local idx = selectedHistoryIndex()
+    if not idx then return end
+    table.remove(history, idx)
+    actionStatus("Deleted entry.")
+end
+
+local function clearHistory()
+    for i = #history, 1, -1 do table.remove(history, i) end
+    selected = 1
+    query = ""
+    actionStatus("Cleared clipboard history.")
+end
+
+local function actionRows()
+    local rows = {
+        { "Return", "Paste item and close" },
+        { "Cmd+Return", "Paste item, keep window open" },
+        { "Cmd+C", "Copy item to clipboard" },
+        { "Space", "Show or hide preview" },
+        { "Cmd+S", "Save item to Desktop" },
+        { "Cmd+Y", "Quick Look item" },
+        { "Cmd+O", "Open file or URL" },
+        { "Cmd+R", "Reveal file in Finder" },
+        { "Cmd+Delete", "Delete selected entry" },
+        { "Cmd+Shift+Delete", "Clear all entries" },
+        { "Up/Down", "Move selection" },
+        { "Type", "Filter history" },
+        { "Delete", "Edit filter text" },
+        { "/ or ?", "Show actions" },
+        { "Esc or Hyper+V", "Close window" },
+    }
+
+    local html = {}
+    for _, row in ipairs(rows) do
+        html[#html + 1] = string.format(
+            '<div class="action-row"><kbd>%s</kbd><span>%s</span></div>',
+            htmlEscape(row[1]),
+            htmlEscape(row[2])
+        )
+    end
+    return table.concat(html, "\n")
+end
+
+local function typeBadge(kind)
+    local labels = {
+        text = "Text",
+        richtext = "Rich",
+        markdown = "MD",
+        image = "Image",
+        file = "File",
+        url = "URL",
+    }
+    return labels[kind] or "Item"
+end
+
+local function previewHTML(item)
+    if not item then
+        return '<div class="empty-detail">No item selected.</div>'
+    end
+
+    if item.kind == "image" and item.imageURL then
+        return '<div class="image-preview"><img src="' .. cssEscape(item.imageURL) .. '" /></div>'
+    end
+
+    if item.kind == "file" then
+        local paths = {}
+        for _, file in ipairs(item.files or {}) do
+            paths[#paths + 1] = htmlEscape(file)
+        end
+        return '<pre class="preview-body">' .. table.concat(paths, "\n") .. '</pre>'
+    end
+
+    local text = item.text or item.title or ""
+    if item.kind == "richtext" and (not text or text == "") then
+        text = "Rich text item with " .. tostring(#(item.types or {})) .. " pasteboard types."
+    end
+    return '<pre class="preview-body">' .. htmlEscape(text) .. '</pre>'
+end
+
+local function renderStatus()
+    if statusText == "" then return "" end
+    return '<div class="status-inline">' .. htmlEscape(statusText) .. '</div>'
+end
+
+local function renderDetail(item)
+    if not detailMode then return "" end
+
+    if detailMode == "preview" then
+        return string.format(
+            '<section class="detail mode-enter"><div class="detail-title">%s</div>%s</section>',
+            htmlEscape(item and item.title or "Preview"),
+            previewHTML(item)
+        )
+    end
+
+    local status = statusText ~= "" and '<div class="status">' .. htmlEscape(statusText) .. '</div>' or ""
+    return '<section class="detail mode-enter"><div class="detail-title">Actions</div>' .. status .. '<div class="actions">' .. actionRows() .. '</div></section>'
+end
+
+local function dragPayload(item)
+    if not item then return "" end
+    if item.kind == "file" and item.files[1] then return item.urls[1] or pathToFileURL(item.files[1]) end
+    if item.kind == "image" and item.imageURL then return item.imageURL end
+    if item.kind == "url" then return item.urls[1] or item.text or "" end
+    return item.text or item.title or ""
 end
 
 local function renderHTML()
     updateFiltered()
 
-    local selectedText = ""
-    local selectedTitle = "Clipboard"
-    local idx = selectedHistoryIndex()
-    if idx then
-        selectedText = history[idx]
-        selectedTitle = clip(oneLine(selectedText), 72)
-    end
-
+    local item = selectedItem()
     local rows = {}
     local firstRow = 1
     if #filtered > VISIBLE_ROWS then
@@ -124,13 +724,15 @@ local function renderHTML()
 
     for rowIndex = firstRow, lastRow do
         local historyIndex = filtered[rowIndex]
-        local text = history[historyIndex]
+        local entry = history[historyIndex]
         local class = rowIndex == selected and "row selected" or "row"
         rows[#rows + 1] = string.format(
-            '<div class="%s"><div class="row-title">%s</div><div class="row-meta">%s</div></div>',
+            '<div class="%s" draggable="true" data-drag="%s"><div class="row-top"><span class="row-title">%s</span><span class="badge">%s</span></div><div class="row-meta">%s</div></div>',
             class,
-            htmlEscape(clip(oneLine(text), 96)),
-            htmlEscape(itemMeta(text))
+            htmlEscape(dragPayload(entry)),
+            htmlEscape(entry.title),
+            htmlEscape(typeBadge(entry.kind)),
+            htmlEscape(clip(entry.subtitle, 120))
         )
     end
 
@@ -140,7 +742,8 @@ local function renderHTML()
 
     local queryText = query ~= "" and htmlEscape(query) or "Clipboard history"
     local countText = #filtered > 0 and tostring(selected) .. " of " .. tostring(#filtered) or "0 items"
-    local preview = selectedText ~= "" and htmlEscape(selectedText) or "No preview"
+    local hasDetailClass = detailMode and " has-detail" or ""
+    local detailWidth = detailMode and "360px 1fr" or "1fr"
 
     return [[
 <!doctype html>
@@ -150,24 +753,26 @@ local function renderHTML()
 <style>
 :root {
   color-scheme: light dark;
-  --bg: rgba(246, 246, 246, 0.86);
-  --sidebar: rgba(234, 234, 234, 0.74);
+  --bg: rgba(246, 246, 246, 0.94);
+  --sidebar: rgba(234, 234, 236, 0.82);
   --line: rgba(0, 0, 0, 0.12);
   --text: #1d1d1f;
   --muted: rgba(60, 60, 67, 0.68);
   --selected: #007aff;
   --selected-muted: rgba(255, 255, 255, 0.78);
+  --surface: rgba(255, 255, 255, 0.48);
 }
 
 @media (prefers-color-scheme: dark) {
   :root {
-    --bg: rgba(32, 32, 34, 0.88);
-    --sidebar: rgba(45, 45, 48, 0.74);
+    --bg: rgba(32, 32, 34, 0.94);
+    --sidebar: rgba(45, 45, 48, 0.82);
     --line: rgba(255, 255, 255, 0.12);
     --text: #f5f5f7;
     --muted: rgba(235, 235, 245, 0.62);
     --selected: #0a84ff;
     --selected-muted: rgba(255, 255, 255, 0.78);
+    --surface: rgba(255, 255, 255, 0.08);
   }
 }
 
@@ -185,23 +790,32 @@ html, body {
 .panel {
   box-sizing: border-box;
   display: grid;
-  grid-template-columns: 340px 1fr;
-  height: calc(100vh - 24px);
-  margin: 12px;
+  grid-template-columns: ]] .. detailWidth .. [[;
+  height: 100vh;
   overflow: hidden;
   border: 1px solid var(--line);
-  border-radius: 16px;
+  border-radius: 18px;
   background: var(--bg);
   color: var(--text);
-  box-shadow: 0 22px 70px rgba(0, 0, 0, 0.28);
+  box-shadow: 0 24px 80px rgba(0, 0, 0, 0.28);
   backdrop-filter: saturate(180%) blur(28px);
+  animation: panelIn 130ms ease-out both;
+}
+
+@keyframes panelIn {
+  from { opacity: 0; transform: translateY(5px) scale(0.992); }
+  to { opacity: 1; transform: translateY(0) scale(1); }
 }
 
 .sidebar {
   min-width: 0;
   overflow: hidden;
-  border-right: 1px solid var(--line);
+  border-right: 0;
   background: var(--sidebar);
+}
+
+.has-detail .sidebar {
+  border-right: 1px solid var(--line);
 }
 
 .query {
@@ -216,6 +830,7 @@ html, body {
   color: var(--muted);
   font-size: 14px;
   font-weight: 500;
+  cursor: move;
 }
 
 .query-title,
@@ -240,19 +855,41 @@ html, body {
   padding: 8px;
 }
 
+.status-inline {
+  margin: 8px 8px 0;
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: var(--surface);
+  color: var(--muted);
+  font-size: 12px;
+}
+
 .row {
   box-sizing: border-box;
-  height: 58px;
+  height: 62px;
   padding: 9px 11px;
   border-radius: 9px;
   overflow: hidden;
+  transition: background-color 120ms ease, color 120ms ease, transform 120ms ease;
+  cursor: grab;
+}
+
+.row:active {
+  cursor: grabbing;
 }
 
 .row + .row {
   margin-top: 2px;
 }
 
+.row-top {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
 .row-title {
+  min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -261,8 +898,18 @@ html, body {
   line-height: 18px;
 }
 
+.badge {
+  flex: 0 0 auto;
+  padding: 2px 6px;
+  border-radius: 6px;
+  background: var(--surface);
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 600;
+}
+
 .row-meta {
-  margin-top: 3px;
+  margin-top: 4px;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -274,26 +921,39 @@ html, body {
 .selected {
   background: var(--selected);
   color: #fff;
+  transform: translateX(1px);
 }
 
-.selected .row-meta {
+.selected .row-meta,
+.selected .badge {
   color: var(--selected-muted);
 }
 
-.empty {
+.empty,
+.empty-detail {
   padding: 18px 11px;
   color: var(--muted);
   font-size: 13px;
 }
 
-.preview {
+.detail {
   box-sizing: border-box;
   min-width: 0;
-  padding: 26px 30px 30px;
+  padding: 24px 28px 28px;
+  overflow: hidden;
 }
 
-.preview-title {
-  margin-bottom: 18px;
+.mode-enter {
+  animation: detailIn 120ms ease-out both;
+}
+
+@keyframes detailIn {
+  from { opacity: 0; transform: translateY(3px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+.detail-title {
+  margin-bottom: 16px;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -302,9 +962,50 @@ html, body {
   font-weight: 600;
 }
 
+.status {
+  margin-bottom: 14px;
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: var(--surface);
+  color: var(--text);
+  font-size: 12px;
+}
+
+.actions {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px 12px;
+}
+
+.action-row {
+  display: grid;
+  grid-template-columns: 116px 1fr;
+  align-items: center;
+  min-height: 28px;
+  gap: 10px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+kbd {
+  display: inline-block;
+  box-sizing: border-box;
+  min-width: 32px;
+  padding: 3px 7px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--surface);
+  color: var(--text);
+  font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", sans-serif;
+  font-size: 11px;
+  font-weight: 600;
+  text-align: center;
+}
+
 .preview-body {
   box-sizing: border-box;
-  height: calc(100% - 34px);
+  height: calc(100vh - 78px);
+  margin: 0;
   overflow: auto;
   color: var(--text);
   font-family: ui-monospace, "SF Mono", Menlo, Monaco, Consolas, monospace;
@@ -314,19 +1015,46 @@ html, body {
   word-break: break-word;
   -webkit-user-select: text;
 }
+
+.image-preview {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: calc(100vh - 78px);
+  overflow: hidden;
+  border-radius: 10px;
+  background: var(--surface);
+}
+
+.image-preview img {
+  display: block;
+  max-width: 100%;
+  max-height: 100%;
+  object-fit: contain;
+}
 </style>
 </head>
 <body>
-  <main class="panel">
+  <main class="panel]] .. hasDetailClass .. [[">
     <section class="sidebar">
       <div class="query"><span class="query-title">]] .. queryText .. [[</span><span class="query-count">]] .. countText .. [[</span></div>
+      ]] .. renderStatus() .. [[
       <div class="rows">]] .. table.concat(rows, "\n") .. [[</div>
     </section>
-    <section class="preview">
-      <div class="preview-title">]] .. htmlEscape(selectedTitle) .. [[</div>
-      <div class="preview-body">]] .. preview .. [[</div>
-    </section>
+    ]] .. renderDetail(item) .. [[
   </main>
+  <script>
+    document.querySelectorAll('.row').forEach(function(row) {
+      row.addEventListener('dragstart', function(event) {
+        var value = row.getAttribute('data-drag') || '';
+        event.dataTransfer.effectAllowed = 'copy';
+        event.dataTransfer.setData('text/plain', value);
+        if (/^https?:\/\//.test(value) || /^file:\/\//.test(value)) {
+          event.dataTransfer.setData('text/uri-list', value);
+        }
+      });
+    });
+  </script>
 </body>
 </html>
 ]]
@@ -334,45 +1062,45 @@ end
 
 local function panelFrame()
     local f = hs.screen.mainScreen():frame()
-    local w = math.min(PANEL_W, f.w - 64)
+    local targetW = detailMode and DETAIL_W or PANEL_W
+    local w = math.min(targetW, f.w - 64)
     local h = math.min(PANEL_H, f.h - 64)
+    local current = panelFrameCache
+    local x = current and current.x or math.floor(f.x + (f.w - w) / 2)
+    local y = current and current.y or math.floor(f.y + (f.h - h) / 2)
     return {
-        x = math.floor(f.x + (f.w - w) / 2),
-        y = math.floor(f.y + (f.h - h) / 2),
+        x = x,
+        y = y,
         w = math.floor(w),
         h = math.floor(h),
     }
 end
 
-local function renderPanel()
+function renderPanel()
     if not _G.clipboardMgrWebview then return end
+    if panelVisible then
+        panelFrameCache = panelFrame()
+        _G.clipboardMgrWebview:frame(panelFrameCache)
+    end
     _G.clipboardMgrWebview:html(renderHTML())
 end
 
 local function hidePanel()
     panelVisible = false
+    draggingPanel = false
     if _G.clipboardMgrKeyTap then _G.clipboardMgrKeyTap:stop() end
-    if _G.clipboardMgrWebview then _G.clipboardMgrWebview:hide(0.08) end
-end
-
-local function chooseSelected()
-    local idx = selectedHistoryIndex()
-    if not idx then return end
-    pb.setContents(history[idx])
-    hidePanel()
+    if _G.clipboardMgrMouseTap then _G.clipboardMgrMouseTap:stop() end
+    if _G.clipboardMgrWebview then
+        _G.clipboardMgrWebview:delete(false, 0.08)
+        _G.clipboardMgrWebview = nil
+    end
 end
 
 local function moveSelection(delta)
     updateFiltered()
     if #filtered == 0 then return end
     selected = math.max(1, math.min(#filtered, selected + delta))
-    renderPanel()
-end
-
-local function deleteSelected()
-    local idx = selectedHistoryIndex()
-    if not idx then return end
-    table.remove(history, idx)
+    statusText = ""
     renderPanel()
 end
 
@@ -387,11 +1115,12 @@ local function buildPanel()
         :shadow(true)
         :level(hs.drawing.windowLevels.floating)
         :windowTitle("Clipboard History")
+        :deleteOnClose(false)
+        :closeOnEscape(false)
         :windowCallback(function(action)
             if action == "closing" then
                 panelVisible = false
                 if _G.clipboardMgrKeyTap then _G.clipboardMgrKeyTap:stop() end
-                _G.clipboardMgrWebview = nil
             end
         end)
 end
@@ -402,14 +1131,20 @@ local function showPanel()
         return
     end
 
+    previousWindow = hs.window.frontmostWindow()
     query = ""
     selected = 1
+    detailMode = nil
+    statusText = ""
+    panelFrameCache = nil
     buildPanel()
-    _G.clipboardMgrWebview:frame(panelFrame())
+    panelFrameCache = panelFrame()
+    _G.clipboardMgrWebview:frame(panelFrameCache)
     renderPanel()
     _G.clipboardMgrWebview:show(0.08):bringToFront(false)
     panelVisible = true
     if _G.clipboardMgrKeyTap then _G.clipboardMgrKeyTap:start() end
+    if _G.clipboardMgrMouseTap then _G.clipboardMgrMouseTap:start() end
 end
 
 local lastChange = pb.changeCount()
@@ -419,11 +1154,8 @@ _G.clipboardMgrTimer = hs.timer.doEvery(POLL, function()
     if c == lastChange then return end
     lastChange = c
 
-    local text = pb.readString()
-    if text then
-        pushText(text)
-        if panelVisible then renderPanel() end
-    end
+    pushEntry(makeEntryFromPasteboard())
+    if panelVisible then renderPanel() end
 end):start()
 
 _G.clipboardMgrKeyTap = eventtap.new({ eventtap.event.types.keyDown }, function(e)
@@ -432,8 +1164,12 @@ _G.clipboardMgrKeyTap = eventtap.new({ eventtap.event.types.keyDown }, function(
     local key = keycodes.map[e:getKeyCode()]
     local flags = e:getFlags()
     local hasCommand = flags.cmd or flags.ctrl or flags.alt
+    local item = selectedItem()
 
-    if key == "escape" then
+    if key == "v" and hasHyper(flags) then
+        hidePanel()
+        return true
+    elseif key == "escape" then
         hidePanel()
         return true
     elseif key == "down" then
@@ -450,40 +1186,135 @@ _G.clipboardMgrKeyTap = eventtap.new({ eventtap.event.types.keyDown }, function(
         return true
     elseif key == "home" then
         selected = 1
+        statusText = ""
         renderPanel()
         return true
     elseif key == "end" then
         updateFiltered()
         selected = math.max(1, #filtered)
+        statusText = ""
+        renderPanel()
+        return true
+    elseif key == "return" and flags.cmd then
+        pasteItem(item, true)
         renderPanel()
         return true
     elseif key == "return" then
-        chooseSelected()
+        pasteItem(item, false)
+        return true
+    elseif key == "space" then
+        detailMode = detailMode == "preview" and nil or "preview"
+        statusText = ""
+        renderPanel()
+        return true
+    elseif key == "c" and flags.cmd then
+        copyItem(item)
+        renderPanel()
+        return true
+    elseif key == "s" and flags.cmd then
+        saveItem(item)
+        renderPanel()
+        return true
+    elseif key == "y" and flags.cmd then
+        quickLookItem(item)
+        renderPanel()
+        return true
+    elseif key == "o" and flags.cmd then
+        openItem(item)
+        renderPanel()
+        return true
+    elseif key == "r" and flags.cmd then
+        revealItem(item)
+        renderPanel()
+        return true
+    elseif key == "delete" and flags.cmd and flags.shift then
+        clearHistory()
+        renderPanel()
         return true
     elseif key == "delete" and flags.cmd then
         deleteSelected()
+        renderPanel()
         return true
     elseif key == "delete" then
         query = dropLastChar(query)
         selected = 1
+        statusText = ""
         renderPanel()
-        return true
-    elseif key == "c" and flags.cmd then
-        chooseSelected()
         return true
     end
 
     if not hasCommand then
         local ch = e:getCharacters(true)
-        if ch and ch ~= "" and ch:match("%C") then
+        if ch == "?" or ch == "/" then
+            detailMode = "help"
+            statusText = ""
+            renderPanel()
+            return true
+        elseif ch and ch ~= "" and ch:match("%C") then
             query = query .. ch
             selected = 1
+            statusText = ""
             renderPanel()
             return true
         end
     end
 
     return true
+end)
+
+local function isPointInFrame(point, frame)
+    return point.x >= frame.x and point.x <= frame.x + frame.w
+        and point.y >= frame.y and point.y <= frame.y + frame.h
+end
+
+local function isInDragHandle(point, frame)
+    return isPointInFrame(point, frame)
+        and point.y >= frame.y
+        and point.y <= frame.y + QUERY_H
+end
+
+_G.clipboardMgrMouseTap = eventtap.new({
+    eventtap.event.types.leftMouseDown,
+    eventtap.event.types.leftMouseDragged,
+    eventtap.event.types.leftMouseUp,
+}, function(e)
+    if not panelVisible or not _G.clipboardMgrWebview then return false end
+
+    local point = hs.mouse.absolutePosition()
+    local frame = panelFrameCache or _G.clipboardMgrWebview:frame()
+    local flags = e:getFlags()
+    local eventType = e:getType()
+
+    if eventType == eventtap.event.types.leftMouseDown then
+        if isPointInFrame(point, frame) and (flags.cmd or isInDragHandle(point, frame)) then
+            draggingPanel = true
+            dragStartMouse = point
+            dragStartFrame = frame
+            return true
+        end
+        return false
+    elseif eventType == eventtap.event.types.leftMouseDragged then
+        if draggingPanel and dragStartMouse and dragStartFrame then
+            panelFrameCache = {
+                x = math.floor(dragStartFrame.x + point.x - dragStartMouse.x),
+                y = math.floor(dragStartFrame.y + point.y - dragStartMouse.y),
+                w = dragStartFrame.w,
+                h = dragStartFrame.h,
+            }
+            _G.clipboardMgrWebview:frame(panelFrameCache)
+            return true
+        end
+        return false
+    elseif eventType == eventtap.event.types.leftMouseUp then
+        if draggingPanel then
+            draggingPanel = false
+            dragStartMouse = nil
+            dragStartFrame = nil
+            return true
+        end
+    end
+
+    return false
 end)
 
 _G.clipboardMgrHotkey = hs.hotkey.bind(HYPER, "v", showPanel)
