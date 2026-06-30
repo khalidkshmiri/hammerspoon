@@ -43,18 +43,10 @@ local function screenSignature()
     return table.concat(parts, "|")
 end
 
--- All layouts, keyed by screen signature. Migrates the old single-layout format
--- (a flat bundleID → frame table) into the current setup's bucket on first read.
+-- All layouts, keyed by screen signature.
 local function loadLayouts()
     local data = hs.settings.get(SETTINGS_KEY)
-    if type(data) ~= "table" then
-        local legacy = hs.settings.get("appRules.layout")
-        if type(legacy) == "table" and next(legacy) ~= nil then
-            return { [screenSignature()] = legacy }
-        end
-        return {}
-    end
-    return data
+    return type(data) == "table" and data or {}
 end
 
 -- The layout for the current screen arrangement, or nil if none captured for it.
