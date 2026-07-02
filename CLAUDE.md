@@ -30,6 +30,7 @@ mouse-driven window management plus a set of keyboard/input/automation shortcuts
     badges, ⌘1-9 pastes that item (keeps open) · ⌘C copy · ⌘Y Quick Look (toggle) ·
     space preview (toggle) · ⌘S save to Desktop · ⌘R reveal · ⌘⌫ delete · ⌘⇧⌫
     clear all · `/` or `?` full-window controls (toggle) · esc close.
+    **Deep dive + gotchas: [`docs/clipboard-manager.md`](docs/clipboard-manager.md).**
   - `dock_quit.lua` — middle-click a Dock icon to quit that app (≡ ⌘Q).
   - `menubar_quit.lua` — middle-click a third-party menu-bar icon to quit its app.
   - `horizontal_scroll.lua` — hold Shift while scrolling to scroll horizontally.
