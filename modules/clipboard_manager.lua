@@ -11,6 +11,12 @@ if _G.clipboardMgrChooser then _G.clipboardMgrChooser:delete() end
 if _G.clipboardMgrKeyTap then _G.clipboardMgrKeyTap:stop() end
 if _G.clipboardMgrMouseTap then _G.clipboardMgrMouseTap:stop() end
 if _G.clipboardMgrWebview then _G.clipboardMgrWebview:delete() end
+if _G.clipboardMgrSnapGuides then
+    for _, guide in pairs(_G.clipboardMgrSnapGuides) do
+        if guide then guide:delete() end
+    end
+    _G.clipboardMgrSnapGuides = nil
+end
 if _G.clipboardMgrQLTask and _G.clipboardMgrQLTask:isRunning() then _G.clipboardMgrQLTask:terminate() end
 
 local pb       = hs.pasteboard
@@ -18,6 +24,8 @@ local webview  = hs.webview
 local eventtap = hs.eventtap
 local keycodes = hs.keycodes
 local task     = hs.task
+local props    = eventtap.event.properties
+local drawing  = hs.drawing
 
 local MAX_ITEMS = 50
 local POLL      = 0.5
@@ -26,10 +34,20 @@ local HYPER     = { "cmd", "ctrl", "alt", "shift" }
 local PANEL_W = 680
 local PANEL_H = 430
 local DETAIL_W = 980
-local VISIBLE_ROWS = 8
 local QUERY_H = 58
+local ROW_H = 62
+local ROW_GAP = 2
+local ROWS_VPAD = 16
+-- The selector/scroll math must match the physical panel height or keyboard
+-- navigation can walk onto clipped rows that users cannot see yet.
+local VISIBLE_ROWS = math.max(1, math.floor(((PANEL_H - QUERY_H - ROWS_VPAD) + ROW_GAP) / (ROW_H + ROW_GAP)))
 local SETTINGS_KEY = "clipboardMgr.history.v2"
+local PANEL_FRAME_KEY = "clipboardMgr.frame.v1"
 local CACHE_DIR = hs.fs.temporaryDirectory() .. "/hammerspoon-clipboard-manager"
+local HOME_Y_OFFSET = -26
+local SNAP_GUIDE_THRESHOLD = 56
+local SNAP_LOCK_THRESHOLD = 18
+local SNAP_GUIDE_THICKNESS = 2
 
 local RICH_UTIS = {
     ["public.rtf"] = true,
@@ -77,6 +95,8 @@ local dragStartFrame = nil
 local panelFrameCache = nil
 local cmdHeld = false
 local visibleFirst = 1
+local skippedRestore = nil
+local lastChange = pb.changeCount()
 local renderPanel
 
 local function oneLine(s)
@@ -126,6 +146,138 @@ local function safeCall(fn, ...)
     if ok then return result end
     return nil
 end
+
+local function storedPanelFrame()
+    local frame = _G.clipboardMgrPanelFrame or hs.settings.get(PANEL_FRAME_KEY)
+    if type(frame) ~= "table" then return nil end
+
+    local x = tonumber(frame.x)
+    local y = tonumber(frame.y)
+    if not x or not y then return nil end
+
+    return {
+        x = math.floor(x),
+        y = math.floor(y),
+    }
+end
+
+local function savePanelFrame(frame)
+    if type(frame) ~= "table" then return end
+
+    local stored = {
+        x = math.floor(frame.x or 0),
+        y = math.floor(frame.y or 0),
+    }
+    _G.clipboardMgrPanelFrame = stored
+    hs.settings.set(PANEL_FRAME_KEY, stored)
+end
+
+local function clampPanelFrame(frame, screenFrame)
+    if type(frame) ~= "table" then return nil end
+
+    local f = screenFrame or hs.screen.mainScreen():frame()
+    local inset = 24
+    local maxX = math.max(f.x + inset, f.x + f.w - frame.w - inset)
+    local maxY = math.max(f.y + inset, f.y + f.h - frame.h - inset)
+
+    return {
+        x = math.floor(math.max(f.x + inset, math.min(frame.x, maxX))),
+        y = math.floor(math.max(f.y + inset, math.min(frame.y, maxY))),
+        w = frame.w,
+        h = frame.h,
+    }
+end
+
+local function homePanelFrame(screenFrame, width, height)
+    local f = screenFrame or hs.screen.mainScreen():frame()
+    return clampPanelFrame({
+        x = math.floor(f.x + (f.w - width) / 2),
+        -- Native macOS floaters usually bias a touch above dead-center; matching
+        -- that gives users a predictable "home" target for drag-to-reset.
+        y = math.floor(f.y + (f.h - height) / 2 + HOME_Y_OFFSET),
+        w = width,
+        h = height,
+    }, f)
+end
+
+local function destroySnapGuides()
+    if not _G.clipboardMgrSnapGuides then return end
+    for _, guide in pairs(_G.clipboardMgrSnapGuides) do
+        if guide then guide:delete() end
+    end
+    _G.clipboardMgrSnapGuides = nil
+end
+
+local function ensureSnapGuides()
+    if _G.clipboardMgrSnapGuides then return _G.clipboardMgrSnapGuides end
+
+    local color = { red = 1, green = 1, blue = 1, alpha = 0.33 }
+    local guides = {
+        vertical = drawing.rectangle({ x = 0, y = 0, w = SNAP_GUIDE_THICKNESS, h = 0 }),
+        horizontal = drawing.rectangle({ x = 0, y = 0, w = 0, h = SNAP_GUIDE_THICKNESS }),
+    }
+
+    for _, guide in pairs(guides) do
+        guide:setFill(true)
+        guide:setFillColor(color)
+        guide:setStroke(false)
+        guide:setLevel(hs.drawing.windowLevels.overlay)
+        guide:hide()
+    end
+
+    _G.clipboardMgrSnapGuides = guides
+    return guides
+end
+
+local function updateSnapGuides(frame)
+    local screenFrame = hs.screen.mainScreen():frame()
+    local home = homePanelFrame(screenFrame, frame.w, frame.h)
+    local guides = ensureSnapGuides()
+    local snapped = {
+        x = frame.x,
+        y = frame.y,
+        w = frame.w,
+        h = frame.h,
+    }
+
+    local dx = math.abs(frame.x - home.x)
+    local dy = math.abs(frame.y - home.y)
+    local showVertical = dx <= SNAP_GUIDE_THRESHOLD
+    local showHorizontal = dy <= SNAP_GUIDE_THRESHOLD
+
+    if dx <= SNAP_LOCK_THRESHOLD then snapped.x = home.x end
+    if dy <= SNAP_LOCK_THRESHOLD then snapped.y = home.y end
+
+    if showVertical then
+        guides.vertical:setFrame({
+            x = math.floor(home.x + (home.w / 2) - (SNAP_GUIDE_THICKNESS / 2)),
+            y = screenFrame.y,
+            w = SNAP_GUIDE_THICKNESS,
+            h = screenFrame.h,
+        })
+        guides.vertical:show()
+    else
+        guides.vertical:hide()
+    end
+
+    if showHorizontal then
+        guides.horizontal:setFrame({
+            x = screenFrame.x,
+            y = math.floor(home.y + (home.h / 2) - (SNAP_GUIDE_THICKNESS / 2)),
+            w = screenFrame.w,
+            h = SNAP_GUIDE_THICKNESS,
+        })
+        guides.horizontal:show()
+    else
+        guides.horizontal:hide()
+    end
+
+    if not showVertical and not showHorizontal then destroySnapGuides() end
+
+    return snapped
+end
+
+panelFrameCache = storedPanelFrame()
 
 local function setStatus(message)
     statusText = message or ""
@@ -491,6 +643,41 @@ local function itemSearchText(item)
     }, " "):lower()
 end
 
+local function visibleRowLimit()
+    return statusText ~= "" and math.max(1, VISIBLE_ROWS - 1) or VISIBLE_ROWS
+end
+
+local function maxVisibleFirst(count)
+    count = count or #filtered
+    return math.max(1, count - visibleRowLimit() + 1)
+end
+
+local function clampVisibleFirst(count)
+    count = count or #filtered
+    if count == 0 then
+        visibleFirst = 1
+        return
+    end
+
+    visibleFirst = math.max(1, math.min(visibleFirst, maxVisibleFirst(count)))
+end
+
+local function ensureSelectionVisible(count)
+    count = count or #filtered
+    if count == 0 then
+        visibleFirst = 1
+        return
+    end
+
+    clampVisibleFirst(count)
+    if selected < visibleFirst then
+        visibleFirst = selected
+    elseif selected > visibleFirst + visibleRowLimit() - 1 then
+        visibleFirst = selected - visibleRowLimit() + 1
+    end
+    clampVisibleFirst(count)
+end
+
 local function selectedHistoryIndex()
     return filtered[selected]
 end
@@ -517,6 +704,8 @@ local function updateFiltered()
     elseif selected < 1 then
         selected = 1
     end
+
+    clampVisibleFirst(#filtered)
 end
 
 local function pushEntry(item)
@@ -536,6 +725,8 @@ end
 
 local function restoreClipboard(item)
     if not item then return false end
+    local restoreChangeCount = safeCall(pb.changeCount) or lastChange
+    local restored = false
 
     -- Prefer typed Cocoa objects for formats that broke when restored as raw UTI
     -- blobs. Falling back to raw data is intentionally narrow so a failed complex
@@ -546,22 +737,36 @@ local function restoreClipboard(item)
             if hs.fs.attributes(file) then table.insert(urls, hs.sharing.fileURL(file)) end
         end
         if #urls == 0 then return false end
-        return safeCall(pb.writeObjects, urls) == true
+        restored = safeCall(pb.writeObjects, urls) == true
     elseif item.kind == "image" and item.image then
-        return safeCall(pb.writeObjects, item.image) == true
+        restored = safeCall(pb.writeObjects, item.image) == true
     elseif item.kind == "image" and item.imageFile then
         local image = hs.image.imageFromPath(item.imageFile)
-        return image and safeCall(pb.writeObjects, image) == true or false
+        restored = image and safeCall(pb.writeObjects, image) == true or false
     elseif item.kind == "url" and (item.urls[1] or item.text) then
-        return pb.setContents(item.urls[1] or item.text)
+        restored = pb.setContents(item.urls[1] or item.text)
     elseif item.kind == "richtext" and item.styledText then
-        return safeCall(pb.writeObjects, item.styledText) == true
+        restored = safeCall(pb.writeObjects, item.styledText) == true
     elseif item.kind == "richtext" and item.text then
-        return pb.setContents(item.text)
+        restored = pb.setContents(item.text)
     elseif item.text then
-        return pb.setContents(item.text)
+        restored = pb.setContents(item.text)
+    else
+        return false
     end
-    return false
+
+    if restored and item.signature then
+        local restoredEntry = makeEntryFromPasteboard()
+        -- Reusing a saved history entry should not silently rewrite recency.
+        -- Skip the next self-generated capture so the list only changes when the
+        -- user explicitly promotes an item.
+        skippedRestore = {
+            signature = (restoredEntry and restoredEntry.signature) or item.signature,
+            changeCount = restoreChangeCount,
+        }
+    end
+
+    return restored
 end
 
 local function actionStatus(message)
@@ -609,6 +814,22 @@ local function copyItem(item)
     else
         actionStatus("Could not copy item.")
     end
+end
+
+local function moveSelectedToTop()
+    local idx = selectedHistoryIndex()
+    if not idx then return end
+    if idx == 1 then
+        actionStatus("Item is already at the top.")
+        return
+    end
+
+    local item = table.remove(history, idx)
+    table.insert(history, 1, item)
+    selected = 1
+    visibleFirst = 1
+    saveHistory()
+    actionStatus("Moved item to the top.")
 end
 
 local function writeItemToTemporaryFile(item)
@@ -763,6 +984,7 @@ end
 local function clearHistory()
     for i = #history, 1, -1 do table.remove(history, i) end
     selected = 1
+    visibleFirst = 1
     query = ""
     saveHistory()
     actionStatus("Cleared clipboard history.")
@@ -770,29 +992,31 @@ end
 
 local function actionRows()
     local rows = {
-        { "Return", "Paste item and close" },
-        { "Cmd+Return", "Paste item, keep window open" },
-        { "Hold Cmd", "Show paste-by-number badges" },
-        { "Cmd+1…9", "Paste numbered item, keep open" },
-        { "Cmd+C", "Copy item to clipboard" },
-        { "Space", "Show or hide preview" },
-        { "Cmd+S", "Save item to Desktop" },
-        { "Cmd+Y", "Quick Look item" },
-        { "Cmd+O", "Open file or URL" },
-        { "Cmd+R", "Reveal file in Finder" },
-        { "Cmd+Delete", "Delete selected entry" },
-        { "Cmd+Shift+Delete", "Clear all entries" },
-        { "Up/Down", "Move selection" },
-        { "Type", "Filter history" },
-        { "Delete", "Edit filter text" },
-        { "/ or ?", "Show actions" },
-        { "Esc or Hyper+V", "Close window" },
+        { "Paste item and close", "↩" },
+        { "Paste item and keep the window open", "⌘↩" },
+        { "Show paste-by-number badges", "hold ⌘" },
+        { "Paste a visible numbered item and keep open", "⌘1…9" },
+        { "Copy the selected item back to the clipboard", "⌘C" },
+        { "Move the selected item to the top", "⌘T" },
+        { "Show or hide the preview pane", "Space" },
+        { "Save the selected item to the Desktop", "⌘S" },
+        { "Quick Look the selected item", "⌘Y" },
+        { "Open the selected file or URL", "⌘O" },
+        { "Reveal the selected file in Finder", "⌘R" },
+        { "Delete the selected history entry", "⌘⌫" },
+        { "Clear the entire clipboard history", "⌘⇧⌫" },
+        { "Move the selection", "↑ ↓  ·  ⇞ ⇟  ·  Home End" },
+        { "Scroll the visible history window", "wheel / two-finger scroll" },
+        { "Filter the history list", "type" },
+        { "Delete the last filter character", "⌫" },
+        { "Toggle this actions sheet", "/  ?" },
+        { "Close the clipboard window", "Esc  ·  Hyper+V" },
     }
 
     local html = {}
     for _, row in ipairs(rows) do
         html[#html + 1] = string.format(
-            '<div class="action-row"><kbd>%s</kbd><span>%s</span></div>',
+            '<div class="action-row"><div class="action-title">%s</div><div class="action-key">%s</div></div>',
             htmlEscape(row[1]),
             htmlEscape(row[2])
         )
@@ -810,6 +1034,26 @@ local function typeBadge(kind)
         url = "URL",
     }
     return labels[kind] or "Item"
+end
+
+local function rowSubtitle(item)
+    local subtitle = normalizeText(item and item.subtitle)
+    if not subtitle or subtitle == "" then return nil end
+
+    local lower = subtitle:lower()
+    if lower == "plain text"
+        or lower == "url"
+        or lower == "markdown text"
+        or lower == "rich text"
+        or lower == "html rich text"
+        or lower == "image"
+        or lower == "file"
+        or lower == "files"
+    then
+        return nil
+    end
+
+    return clip(subtitle, 120)
 end
 
 local function previewHTML(item)
@@ -871,28 +1115,27 @@ local function renderHTML()
 
     local item = selectedItem()
     local rows = {}
-    local firstRow = 1
-    if #filtered > VISIBLE_ROWS then
-        firstRow = math.max(1, math.min(selected - 3, #filtered - VISIBLE_ROWS + 1))
-    end
-    local lastRow = math.min(#filtered, firstRow + VISIBLE_ROWS - 1)
-    visibleFirst = firstRow
+    local firstRow = visibleFirst
+    local lastRow = math.min(#filtered, firstRow + visibleRowLimit() - 1)
 
     for rowIndex = firstRow, lastRow do
         local historyIndex = filtered[rowIndex]
         local entry = history[historyIndex]
+        local subtitle = rowSubtitle(entry)
         local class = rowIndex == selected and "row selected" or "row"
         local num = rowIndex - firstRow + 1
         local numHTML = (cmdHeld and num <= 9) and ('<span class="num">' .. num .. '</span>') or ""
+        local metaHTML = subtitle and ('<div class="row-meta">' .. htmlEscape(subtitle) .. '</div>') or ""
         rows[#rows + 1] = string.format(
-            '<div class="%s" draggable="true" data-index="%d" data-drag="%s"><div class="row-top">%s<span class="row-title">%s</span><span class="badge">%s</span></div><div class="row-meta">%s</div></div>',
+            '<div class="%s%s" draggable="true" data-index="%d" data-drag="%s"><div class="row-top">%s<span class="row-title">%s</span><span class="badge">%s</span></div>%s</div>',
             class,
+            subtitle and "" or " single-line",
             rowIndex,
             htmlEscape(dragPayload(entry)),
             numHTML,
             htmlEscape(entry.title),
             htmlEscape(typeBadge(entry.kind)),
-            htmlEscape(clip(entry.subtitle, 120))
+            metaHTML
         )
     end
 
@@ -909,7 +1152,7 @@ local function renderHTML()
     if detailMode == "help" then
         mainHTML = [[
   <main class="panel help-panel">
-    <div class="query"><span class="query-title">Keyboard controls</span><span class="query-count">esc to close</span></div>
+    <div class="query"><span class="query-title">Actions</span><span class="query-count">esc to close</span></div>
     <div class="help-scroll"><div class="actions">]] .. actionRows() .. [[</div></div>
   </main>]]
     else
@@ -983,6 +1226,8 @@ html, body {
 }
 
 .sidebar {
+  display: flex;
+  flex-direction: column;
   min-width: 0;
   overflow: hidden;
   border-right: 0;
@@ -1025,7 +1270,8 @@ html, body {
 }
 
 .rows {
-  height: calc(100% - 58px);
+  flex: 1 1 auto;
+  min-height: 0;
   overflow: hidden;
   padding: 8px;
 }
@@ -1041,6 +1287,9 @@ html, body {
 
 .row {
   box-sizing: border-box;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
   height: 62px;
   padding: 9px 11px;
   border-radius: 9px;
@@ -1061,9 +1310,15 @@ html, body {
   display: flex;
   align-items: center;
   gap: 8px;
+  width: 100%;
+}
+
+.single-line .row-top {
+  min-height: 18px;
 }
 
 .row-title {
+  flex: 1 1 auto;
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -1075,6 +1330,7 @@ html, body {
 
 .badge {
   flex: 0 0 auto;
+  margin-left: auto;
   padding: 2px 6px;
   border-radius: 6px;
   background: var(--surface);
@@ -1139,33 +1395,30 @@ html, body {
 
 .actions {
   display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: 8px 12px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 6px 8px;
 }
 
 .action-row {
-  display: grid;
-  grid-template-columns: 116px 1fr;
-  align-items: center;
-  min-height: 28px;
-  gap: 10px;
-  color: var(--muted);
-  font-size: 12px;
+  box-sizing: border-box;
+  padding: 8px 10px;
+  border-radius: 9px;
+  background: var(--surface);
 }
 
-kbd {
-  display: inline-block;
-  box-sizing: border-box;
-  min-width: 32px;
-  padding: 3px 7px;
-  border: 1px solid var(--line);
-  border-radius: 6px;
-  background: var(--surface);
+.action-title {
   color: var(--text);
-  font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", sans-serif;
-  font-size: 11px;
+  font-size: 12px;
   font-weight: 600;
-  text-align: center;
+  line-height: 15px;
+}
+
+.action-key {
+  margin-top: 2px;
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 500;
+  line-height: 13px;
 }
 
 .preview-body {
@@ -1226,7 +1479,7 @@ kbd {
 .help-scroll {
   box-sizing: border-box;
   height: calc(100% - 58px);
-  padding: 20px 24px;
+  padding: 14px 16px;
   overflow: auto;
 }
 </style>
@@ -1270,18 +1523,19 @@ end
 
 local function panelFrame()
     local f = hs.screen.mainScreen():frame()
-    local targetW = detailMode and DETAIL_W or PANEL_W
+    local targetW = detailMode == "preview" and DETAIL_W or PANEL_W
     local w = math.min(targetW, f.w - 64)
     local h = math.min(PANEL_H, f.h - 64)
+    local home = homePanelFrame(f, math.floor(w), math.floor(h))
     local current = panelFrameCache
-    local x = current and current.x or math.floor(f.x + (f.w - w) / 2)
-    local y = current and current.y or math.floor(f.y + (f.h - h) / 2)
-    return {
+    local x = current and current.x or home.x
+    local y = current and current.y or home.y
+    return clampPanelFrame({
         x = x,
         y = y,
         w = math.floor(w),
         h = math.floor(h),
-    }
+    }, f)
 end
 
 function renderPanel()
@@ -1289,15 +1543,18 @@ function renderPanel()
     if panelVisible then
         panelFrameCache = panelFrame()
         _G.clipboardMgrWebview:frame(panelFrameCache)
+        savePanelFrame(panelFrameCache)
     end
     _G.clipboardMgrWebview:html(renderHTML())
 end
 
 local function hidePanel()
+    if panelFrameCache then savePanelFrame(panelFrameCache) end
     panelVisible = false
     draggingPanel = false
     panelHasInput = false
     cmdHeld = false
+    destroySnapGuides()
     if _G.clipboardMgrKeyTap then _G.clipboardMgrKeyTap:stop() end
     if _G.clipboardMgrMouseTap then _G.clipboardMgrMouseTap:stop() end
     if _G.clipboardMgrWebview then
@@ -1310,8 +1567,39 @@ local function moveSelection(delta)
     updateFiltered()
     if #filtered == 0 then return end
     selected = math.max(1, math.min(#filtered, selected + delta))
+    ensureSelectionVisible(#filtered)
     statusText = ""
     renderPanel()
+end
+
+local function scrollRows(delta)
+    updateFiltered()
+    if #filtered == 0 then return end
+
+    local newFirst = math.max(1, math.min(maxVisibleFirst(#filtered), visibleFirst + delta))
+    if newFirst == visibleFirst then return end
+
+    visibleFirst = newFirst
+    local lastVisible = math.min(#filtered, visibleFirst + visibleRowLimit() - 1)
+    if selected < visibleFirst then
+        selected = visibleFirst
+    elseif selected > lastVisible then
+        selected = lastVisible
+    end
+
+    statusText = ""
+    renderPanel()
+end
+
+local function pasteVisibleItem(offset, keepOpen)
+    updateFiltered()
+    local target = visibleFirst + offset - 1
+    if not filtered[target] then return false end
+
+    selected = target
+    pasteItem(history[filtered[target]], keepOpen)
+    if panelVisible then renderPanel() end
+    return true
 end
 
 -- First click on a row selects it; clicking the already-selected row pastes and
@@ -1371,10 +1659,12 @@ local function showPanel()
     previousWindow = hs.window.frontmostWindow()
     query = ""
     selected = 1
+    visibleFirst = 1
     detailMode = nil
     statusText = ""
-    panelFrameCache = nil
-    panelHasInput = true
+    -- Opening as a floating reference lets users keep typing in the target app
+    -- immediately; clicking into the panel is the explicit opt-in to navigate/filter.
+    panelHasInput = false
     cmdHeld = false
     buildPanel()
     panelFrameCache = panelFrame()
@@ -1386,15 +1676,22 @@ local function showPanel()
     if _G.clipboardMgrMouseTap then _G.clipboardMgrMouseTap:start() end
 end
 
-local lastChange = pb.changeCount()
-
 _G.clipboardMgrTimer = hs.timer.doEvery(POLL, function()
     guarded("capture", function()
         local c = pb.changeCount()
         if c == lastChange then return end
         lastChange = c
 
-        pushEntry(makeEntryFromPasteboard())
+        local entry = makeEntryFromPasteboard()
+        local skipRestore = skippedRestore
+        skippedRestore = nil
+
+        if skipRestore and entry and entry.signature == skipRestore.signature and c > skipRestore.changeCount then
+            if panelVisible then renderPanel() end
+            return
+        end
+
+        pushEntry(entry)
         if panelVisible then renderPanel() end
     end)
 end):start()
@@ -1422,6 +1719,8 @@ _G.clipboardMgrKeyTap = eventtap.new({ eventtap.event.types.keyDown, eventtap.ev
         if key == "v" and hasHyper(flags) then
             hidePanel()
             return true
+        elseif hasHyper(flags) and key and key:match("^[1-9]$") then
+            return pasteVisibleItem(tonumber(key), true)
         end
 
         -- Esc closes from anywhere, even after focus has moved to another app.
@@ -1449,12 +1748,14 @@ _G.clipboardMgrKeyTap = eventtap.new({ eventtap.event.types.keyDown, eventtap.ev
             return true
         elseif key == "home" then
             selected = 1
+            ensureSelectionVisible(#filtered)
             statusText = ""
             renderPanel()
             return true
         elseif key == "end" then
             updateFiltered()
             selected = math.max(1, #filtered)
+            ensureSelectionVisible(#filtered)
             statusText = ""
             renderPanel()
             return true
@@ -1466,14 +1767,7 @@ _G.clipboardMgrKeyTap = eventtap.new({ eventtap.event.types.keyDown, eventtap.ev
             pasteItem(item, false)
             return true
         elseif flags.cmd and key and key:match("^[1-9]$") then
-            local target = visibleFirst + tonumber(key) - 1
-            updateFiltered()
-            if filtered[target] then
-                selected = target
-                pasteItem(history[filtered[target]], true)
-                renderPanel()
-            end
-            return true
+            return pasteVisibleItem(tonumber(key), true)
         elseif key == "space" then
             -- `x and nil or y` always yields y in Lua, so toggle with the
             -- truthy value first to actually hide on the second press.
@@ -1483,6 +1777,10 @@ _G.clipboardMgrKeyTap = eventtap.new({ eventtap.event.types.keyDown, eventtap.ev
             return true
         elseif key == "c" and flags.cmd then
             copyItem(item)
+            renderPanel()
+            return true
+        elseif key == "t" and flags.cmd then
+            moveSelectedToTop()
             renderPanel()
             return true
         elseif key == "s" and flags.cmd then
@@ -1512,6 +1810,7 @@ _G.clipboardMgrKeyTap = eventtap.new({ eventtap.event.types.keyDown, eventtap.ev
         elseif key == "delete" then
             query = dropLastChar(query)
             selected = 1
+            visibleFirst = 1
             statusText = ""
             renderPanel()
             return true
@@ -1527,6 +1826,7 @@ _G.clipboardMgrKeyTap = eventtap.new({ eventtap.event.types.keyDown, eventtap.ev
             elseif ch and ch ~= "" and ch:match("%C") then
                 query = query .. ch
                 selected = 1
+                visibleFirst = 1
                 statusText = ""
                 renderPanel()
                 return true
@@ -1564,6 +1864,7 @@ _G.clipboardMgrMouseTap = eventtap.new({
     eventtap.event.types.leftMouseDragged,
     eventtap.event.types.leftMouseUp,
     eventtap.event.types.mouseMoved,
+    eventtap.event.types.scrollWheel,
 }, function(e)
     if not panelVisible or not _G.clipboardMgrWebview then return false end
 
@@ -1571,6 +1872,22 @@ _G.clipboardMgrMouseTap = eventtap.new({
     local frame = panelFrameCache or _G.clipboardMgrWebview:frame()
     local flags = e:getFlags()
     local eventType = e:getType()
+
+    if eventType == eventtap.event.types.scrollWheel then
+        local overHistory = isPointInFrame(point, frame)
+            and point.y >= frame.y + QUERY_H
+            and (detailMode ~= "preview" or point.x <= frame.x + math.min(360, frame.w))
+        if not overHistory or detailMode == "help" then return false end
+
+        local dy = e:getProperty(props.scrollWheelEventDeltaAxis1)
+        if not dy or dy == 0 then
+            dy = e:getProperty(props.scrollWheelEventPointDeltaAxis1)
+        end
+        if not dy or dy == 0 then return false end
+
+        scrollRows(dy < 0 and 1 or -1)
+        return true
+    end
 
     if eventType == eventtap.event.types.mouseMoved then
         if isPointInFrame(point, frame) then updateHover(point, frame) end
@@ -1580,6 +1897,7 @@ _G.clipboardMgrMouseTap = eventtap.new({
     if eventType == eventtap.event.types.leftMouseDown then
         if not isPointInFrame(point, frame) then
             panelHasInput = false
+            destroySnapGuides()
             return false
         end
 
@@ -1596,12 +1914,13 @@ _G.clipboardMgrMouseTap = eventtap.new({
         return false
     elseif eventType == eventtap.event.types.leftMouseDragged then
         if draggingPanel and dragStartMouse and dragStartFrame then
-            panelFrameCache = {
+            panelFrameCache = clampPanelFrame({
                 x = math.floor(dragStartFrame.x + point.x - dragStartMouse.x),
                 y = math.floor(dragStartFrame.y + point.y - dragStartMouse.y),
                 w = dragStartFrame.w,
                 h = dragStartFrame.h,
-            }
+            })
+            panelFrameCache = updateSnapGuides(panelFrameCache)
             _G.clipboardMgrWebview:frame(panelFrameCache)
             return true
         end
@@ -1611,6 +1930,8 @@ _G.clipboardMgrMouseTap = eventtap.new({
             draggingPanel = false
             dragStartMouse = nil
             dragStartFrame = nil
+            destroySnapGuides()
+            if panelFrameCache then savePanelFrame(panelFrameCache) end
             return true
         end
     end

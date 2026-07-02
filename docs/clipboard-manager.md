@@ -125,9 +125,14 @@ plain `text` (acceptable; the alternative is bloating settings with RTF blobs).
 `signatureFor(data, types, text, urls)` builds a stable string from the sorted
 UTIs (name + length + 64-char prefix), the type list, the URLs, and a 256-char
 text prefix. `pushEntry()` removes any existing entry with the same signature
-before inserting the new one at the top — so re-copying something moves it to the
-front instead of duplicating it. Persisted entries carry their signature so dedup
-keeps working across reloads.
+before inserting the new one at the top — so genuinely new captures dedup
+instead of duplicating. Persisted entries carry their signature so dedup keeps
+working across reloads.
+
+Restoring an older history entry for paste/copy is handled separately:
+`restoreClipboard()` sets a one-shot `skippedRestore` token, and the poller
+drops that next self-generated capture if the signature matches. That keeps
+reused items in their current position until the user explicitly promotes one.
 
 > **Watch:** `signatureFor` concatenates `urls`. If `urls` ever contains a
 > non-string (it used to — see gotcha #1), this line throws and the whole capture
@@ -187,12 +192,22 @@ translucent, rounded, native-looking list. But the panel is created with
 |--------------|--------|-------|---------|
 | `nil` | List only | `PANEL_W` = 680 | default |
 | `"preview"` | List + preview pane (grid `360px 1fr`) | `DETAIL_W` = 980 | `Space` |
-| `"help"` | Full-window keyboard-controls sheet | `DETAIL_W` = 980 | `/` or `?` |
+| `"help"` | Compact actions sheet | `PANEL_W` = 680 | `/` or `?` |
 
 `panelFrame()` picks the width from `detailMode` and keeps the panel's cached
 `x/y` so it doesn't jump position when it widens/narrows. `renderPanel()`
 re-applies the frame and re-sets the whole HTML on every state change (there is no
 incremental DOM update — the doc is small, so a full re-render is simplest).
+
+The position is also persisted via `hs.settings` (`clipboardMgr.frame.v1`). That
+is necessary because the panel is intentionally deleted on close to stay
+lightweight, so the next show has to rebuild both the webview and its last known
+origin from plain Lua data.
+
+When there is no saved origin, the panel uses a "home" position: horizontally
+centered, but a little above dead-center. Dragging back near that home target
+shows full-screen crosshair guides and snaps the panel back into place once the
+origin is very close.
 
 ### Dragging the panel & dragging rows
 
@@ -200,11 +215,16 @@ The mouse tap distinguishes three intents on `leftMouseDown` inside the frame:
 
 1. **Cmd-held or on the title bar** (`isInDragHandle`, top `QUERY_H+8` px) →
    start moving the whole panel (tap returns `true`, consumes the event, and
-   updates `panelFrameCache` on drag).
+   updates `panelFrameCache` on drag). Near the home position, drag feedback also
+   shows full-screen guide lines and snaps back once the frame is close enough.
 2. **On a row** → return `false` so WebKit gets the event and can start a native
    HTML5 drag (drop a file/image/text into Finder or another app). Row markup
    sets `draggable="true"` and a `data-drag` payload.
-3. **Outside the frame** → set `panelHasInput = false` and pass through. This is
+3. **Scroll wheel / two-finger scroll over the list** → move the fixed
+   visible-row viewport through history without changing the overall panel size.
+   The current `visibleFirst` row still drives the `⌘1`–`⌘9` badges, so the
+   numbers always map to what is on screen.
+4. **Outside the frame** → set `panelHasInput = false` and pass through. This is
    the "float while you work elsewhere" behavior (see below).
 
 ### Click-to-select / click-to-paste
@@ -243,11 +263,12 @@ can detect Cmd being held for the number badges). Structure of the handler:
 1. `if not panelVisible: return false` — do nothing when hidden.
 2. `flagsChanged` → update `cmdHeld`, re-render, **return false** (never consume a
    modifier).
-3. `Hyper+V` → close. `Esc` → close. **These two act regardless of focus** — they
+3. `Hyper+V` → close. `Hyper+1`–`Hyper+9` → paste the visible numbered item while
+   keeping the panel open. `Esc` → close. **These act regardless of focus** — they
    are checked *before* the `panelHasInput` gate.
-4. `if not panelHasInput: return false` — once you've clicked outside the panel,
-   ordinary shortcuts (Cmd+C, typing, arrows) pass through to whatever app you're
-   now working in, so the manager doesn't hijack them while it floats.
+4. `if not panelHasInput: return false` — the panel now opens in this floating
+   state by default, so ordinary typing keeps going to the app underneath until
+   you click into the panel on purpose.
 5. Everything else: navigation, actions, filter typing.
 
 ### Full bindings
@@ -258,7 +279,9 @@ can detect Cmd being held for the number badges). Structure of the handler:
 | `⌘↩` | Paste selected item, keep panel open |
 | **Hold `⌘`** | Show `1–9` badges beside the visible rows |
 | `⌘1`–`⌘9` | Paste the *n*-th visible item, keep panel open |
+| `Hyper+1`–`Hyper+9` | Paste the *n*-th visible item, keep panel open, even while working in another app |
 | `⌘C` | Copy item back to the system clipboard |
+| `⌘T` | Move the selected history entry to the top |
 | `Space` | Toggle the preview pane |
 | `⌘Y` | Toggle Quick Look |
 | `⌘S` | Save item to Desktop |
@@ -267,9 +290,10 @@ can detect Cmd being held for the number badges). Structure of the handler:
 | `⌘⌫` | Delete selected entry |
 | `⌘⇧⌫` | Clear all entries |
 | `↑ ↓` / `PgUp PgDn` / `Home End` | Move selection |
+| mouse wheel / two-finger scroll | Scroll the visible history window |
 | *type any char* | Append to the filter query |
 | `⌫` | Edit (backspace) the filter query |
-| `/` or `?` | Toggle the full-window controls sheet |
+| `/` or `?` | Toggle the compact actions sheet |
 | `Esc` or `Hyper+V` | Close |
 
 > The number badges map to **visible** rows: `⌘n` pastes `filtered[visibleFirst + n − 1]`,
@@ -310,6 +334,7 @@ can detect Cmd being held for the number badges). Structure of the handler:
 ## 8. Persistence
 
 - Key: `hs.settings` under `clipboardMgr.history.v2`.
+- Panel origin: `hs.settings` under `clipboardMgr.frame.v1`.
 - Images mirrored as PNG into
   `$TMPDIR/hammerspoon-clipboard-manager/` (`CACHE_DIR`).
 - `MAX_ITEMS = 50`; oldest entries fall off the end on each `pushEntry`.
@@ -443,12 +468,17 @@ captured while the list is visible). Only `Hyper+V` and `Esc` still act. If you
 expect a shortcut to work "always", it must be checked **before** the
 `panelHasInput` gate (that's exactly the fix that made `Esc` close from anywhere).
 
-### 11. Frame width jumps between modes are deliberate
+### 11. Preview width jumps are deliberate; help stays compact
 
-`panelFrame()` returns `DETAIL_W` (980) whenever `detailMode` is set and `PANEL_W`
-(680) otherwise, reusing cached `x/y`. This is how you verify mode in a test
-without reading a private local: `_G.clipboardMgrWebview:frame().w` is 680 in list
-mode, 980 in preview/help.
+`panelFrame()` returns `DETAIL_W` (980) only for preview mode and `PANEL_W`
+(680) otherwise, reusing cached `x/y` and persisting that origin through
+`clipboardMgr.frame.v1`. This is how you verify mode in a test without reading a
+private local: `_G.clipboardMgrWebview:frame().w` is 680 in list/help mode and
+980 in preview.
+
+The default "home" frame is also intentional: it sits slightly above exact
+screen center so the drag-to-reset guides feel more like native macOS floating
+panels than a mathematically centered rectangle.
 
 ### 12. Row-drag payloads and the image-file trick
 
@@ -456,6 +486,14 @@ Finder converts a dragged `data:image/…` URL into a text file, so image rows m
 advertise the **cached PNG path** (`pathToFileURL(item.imageFile)`) as their drag
 payload, not the data URL. `dragPayload()` encodes this per kind; keep it in sync
 if you add a kind.
+
+### 13. Restoring an item is intentionally not a recency update
+
+Using an old entry via `⌘C`, `↩`, or `⌘↩` writes it back to the system
+pasteboard, which would normally look like a new capture and bump it to the
+front. The module now tags that restore and ignores the next matching poller
+capture, so history order stays stable. `⌘T` is the explicit "move this to the
+top" action.
 
 ---
 
@@ -498,12 +536,14 @@ caught error in the console, and Hammerspoon/macOS API return shapes (like
   branch, and (if savable) a `saveItem`/`writeItemToTemporaryFile` branch. Decide
   what persists (`serializeEntry`).
 - **New binding:** add a branch in the key-tap `if/elseif` chain, add a row to
-  `actionRows()` so it shows in the help sheet, and update `CLAUDE.md`'s binding
-  summary.
+  `actionRows()` so it shows in the help sheet, and decide whether it should
+  affect clipboard recency or preserve order like the restore actions do.
 - **New persistent tap/timer:** create it on `_G`, and add a teardown line at the
   top of the file.
 
 ## Tunables (top of file)
 
 `MAX_ITEMS` 50 · `POLL` 0.5s · `PANEL_W` 680 · `DETAIL_W` 980 · `PANEL_H` 430 ·
-`VISIBLE_ROWS` 8 · `HYPER` `⌘⌃⌥⇧` · `SETTINGS_KEY` `clipboardMgr.history.v2`.
+`VISIBLE_ROWS` derived from panel height and row CSS so selection never runs onto
+clipped rows · `HYPER` `⌘⌃⌥⇧` · `SETTINGS_KEY` `clipboardMgr.history.v2` ·
+`PANEL_FRAME_KEY` `clipboardMgr.frame.v1`.
