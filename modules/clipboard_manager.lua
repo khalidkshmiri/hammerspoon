@@ -11,6 +11,7 @@ if _G.clipboardMgrChooser then _G.clipboardMgrChooser:delete() end
 if _G.clipboardMgrKeyTap then _G.clipboardMgrKeyTap:stop() end
 if _G.clipboardMgrMouseTap then _G.clipboardMgrMouseTap:stop() end
 if _G.clipboardMgrWebview then _G.clipboardMgrWebview:delete() end
+if _G.clipboardMgrQLTask and _G.clipboardMgrQLTask:isRunning() then _G.clipboardMgrQLTask:terminate() end
 
 local pb       = hs.pasteboard
 local webview  = hs.webview
@@ -74,6 +75,8 @@ local draggingPanel = false
 local dragStartMouse = nil
 local dragStartFrame = nil
 local panelFrameCache = nil
+local cmdHeld = false
+local visibleFirst = 1
 local renderPanel
 
 local function oneLine(s)
@@ -188,6 +191,33 @@ end
 local function pathToFileURL(path)
     if type(path) ~= "string" then return "" end
     return "file://" .. percentEncodePath(path)
+end
+
+-- hs.pasteboard.readURL now returns NSURL objects as tables ({url=,filePath=}),
+-- not strings. Flattening them here is the root fix: otherwise every file/URL
+-- capture throws on the first string op (signature/setContents) and is dropped.
+-- Prefer the resolved filePath: Finder hands multi-file copies as opaque
+-- /.file/id= reference URLs, whose only usable form is the NSURL's POSIX path.
+local function urlToString(u)
+    if type(u) == "string" then return u end
+    if type(u) ~= "table" then return nil end
+    if type(u.filePath) == "string" and u.filePath ~= "" then return pathToFileURL(u.filePath) end
+    return u.url
+end
+
+local function readURLStrings()
+    local raw = safeCall(pb.readURL, true)
+    local list = type(raw) == "table" and raw or {}
+    if #list == 0 then
+        local single = safeCall(pb.readURL)
+        if single then list = { single } end
+    end
+    local out = {}
+    for _, u in ipairs(list) do
+        local s = urlToString(u)
+        if s and s ~= "" then out[#out + 1] = s end
+    end
+    return out
 end
 
 local function appendUnique(list, value)
@@ -355,7 +385,7 @@ local function makeEntryFromPasteboard()
     local text = normalizeText(safeCall(pb.readString))
     local image = safeCall(pb.readImage)
     local styledText = safeCall(pb.readStyledText)
-    local urls = asList(safeCall(pb.readURL, true) or safeCall(pb.readURL))
+    local urls = readURLStrings()
     local files = extractFiles(types, urls)
 
     local kind = "text"
@@ -669,6 +699,14 @@ local function saveItem(item)
 end
 
 local function quickLookItem(item)
+    -- Toggle: a second press closes the panel qlmanage already put on screen.
+    if _G.clipboardMgrQLTask and _G.clipboardMgrQLTask:isRunning() then
+        _G.clipboardMgrQLTask:terminate()
+        _G.clipboardMgrQLTask = nil
+        actionStatus("Closed Quick Look.")
+        return
+    end
+
     if not item then return end
     local files = item.kind == "file" and item.files or nil
     if not files or #files == 0 then
@@ -683,7 +721,9 @@ local function quickLookItem(item)
 
     local args = { "-p" }
     for _, file in ipairs(files) do table.insert(args, file) end
-    if startTask("/usr/bin/qlmanage", args) then
+    local t = task.new("/usr/bin/qlmanage", nil, nil, args)
+    if t and t:start() then
+        _G.clipboardMgrQLTask = t
         actionStatus("Opened Quick Look.")
     else
         actionStatus("Could not start Quick Look.")
@@ -732,6 +772,8 @@ local function actionRows()
     local rows = {
         { "Return", "Paste item and close" },
         { "Cmd+Return", "Paste item, keep window open" },
+        { "Hold Cmd", "Show paste-by-number badges" },
+        { "Cmd+1…9", "Paste numbered item, keep open" },
         { "Cmd+C", "Copy item to clipboard" },
         { "Space", "Show or hide preview" },
         { "Cmd+S", "Save item to Desktop" },
@@ -834,15 +876,20 @@ local function renderHTML()
         firstRow = math.max(1, math.min(selected - 3, #filtered - VISIBLE_ROWS + 1))
     end
     local lastRow = math.min(#filtered, firstRow + VISIBLE_ROWS - 1)
+    visibleFirst = firstRow
 
     for rowIndex = firstRow, lastRow do
         local historyIndex = filtered[rowIndex]
         local entry = history[historyIndex]
         local class = rowIndex == selected and "row selected" or "row"
+        local num = rowIndex - firstRow + 1
+        local numHTML = (cmdHeld and num <= 9) and ('<span class="num">' .. num .. '</span>') or ""
         rows[#rows + 1] = string.format(
-            '<div class="%s" draggable="true" data-drag="%s"><div class="row-top"><span class="row-title">%s</span><span class="badge">%s</span></div><div class="row-meta">%s</div></div>',
+            '<div class="%s" draggable="true" data-index="%d" data-drag="%s"><div class="row-top">%s<span class="row-title">%s</span><span class="badge">%s</span></div><div class="row-meta">%s</div></div>',
             class,
+            rowIndex,
             htmlEscape(dragPayload(entry)),
+            numHTML,
             htmlEscape(entry.title),
             htmlEscape(typeBadge(entry.kind)),
             htmlEscape(clip(entry.subtitle, 120))
@@ -855,8 +902,27 @@ local function renderHTML()
 
     local queryText = query ~= "" and htmlEscape(query) or "Clipboard history"
     local countText = #filtered > 0 and tostring(selected) .. " of " .. tostring(#filtered) or "0 items"
-    local hasDetailClass = detailMode and " has-detail" or ""
-    local detailWidth = detailMode and "360px 1fr" or "1fr"
+    local hasDetailClass = detailMode == "preview" and " has-detail" or ""
+    local detailWidth = detailMode == "preview" and "360px 1fr" or "1fr"
+
+    local mainHTML
+    if detailMode == "help" then
+        mainHTML = [[
+  <main class="panel help-panel">
+    <div class="query"><span class="query-title">Keyboard controls</span><span class="query-count">esc to close</span></div>
+    <div class="help-scroll"><div class="actions">]] .. actionRows() .. [[</div></div>
+  </main>]]
+    else
+        mainHTML = [[
+  <main class="panel]] .. hasDetailClass .. [[">
+    <section class="sidebar">
+      <div class="query"><span class="query-title">]] .. queryText .. [[</span><span class="query-count">]] .. countText .. [[</span></div>
+      ]] .. renderStatus() .. [[
+      <div class="rows">]] .. table.concat(rows, "\n") .. [[</div>
+    </section>
+    ]] .. renderDetail(item) .. [[
+  </main>]]
+    end
 
     return [[
 <!doctype html>
@@ -1130,17 +1196,39 @@ kbd {
   max-height: 100%;
   object-fit: contain;
 }
+
+.row:hover:not(.selected) {
+  background: var(--surface);
+}
+
+.num {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 18px;
+  height: 18px;
+  border-radius: 5px;
+  background: var(--surface);
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.selected .num {
+  background: rgba(255, 255, 255, 0.25);
+  color: #fff;
+}
+
+.help-scroll {
+  box-sizing: border-box;
+  height: calc(100% - 58px);
+  padding: 20px 24px;
+  overflow: auto;
+}
 </style>
 </head>
-<body>
-  <main class="panel]] .. hasDetailClass .. [[">
-    <section class="sidebar">
-      <div class="query"><span class="query-title">]] .. queryText .. [[</span><span class="query-count">]] .. countText .. [[</span></div>
-      ]] .. renderStatus() .. [[
-      <div class="rows">]] .. table.concat(rows, "\n") .. [[</div>
-    </section>
-    ]] .. renderDetail(item) .. [[
-  </main>
+<body>]] .. mainHTML .. [[
   <script>
     document.querySelectorAll('.row').forEach(function(row) {
       row.addEventListener('dragstart', function(event) {
@@ -1150,6 +1238,14 @@ kbd {
         if (/^https?:\/\//.test(value) || /^file:\/\//.test(value)) {
           event.dataTransfer.setData('text/uri-list', value);
         }
+      });
+      row.addEventListener('click', function() {
+        try {
+          window.webkit.messageHandlers.clipboardMgr.postMessage({
+            type: 'click',
+            index: parseInt(row.getAttribute('data-index'), 10)
+          });
+        } catch (e) {}
       });
     });
   </script>
@@ -1187,6 +1283,7 @@ local function hidePanel()
     panelVisible = false
     draggingPanel = false
     panelHasInput = false
+    cmdHeld = false
     if _G.clipboardMgrKeyTap then _G.clipboardMgrKeyTap:stop() end
     if _G.clipboardMgrMouseTap then _G.clipboardMgrMouseTap:stop() end
     if _G.clipboardMgrWebview then
@@ -1203,10 +1300,37 @@ local function moveSelection(delta)
     renderPanel()
 end
 
+-- First click on a row selects it; clicking the already-selected row pastes and
+-- closes (matches Finder-style single/double intent for a keyboardless panel).
+local function handleRowClick(rowIndex)
+    rowIndex = rowIndex and math.floor(rowIndex) or nil
+    updateFiltered()
+    if not rowIndex or not filtered[rowIndex] then return end
+    if rowIndex == selected then
+        pasteItem(history[filtered[rowIndex]], false)
+    else
+        selected = rowIndex
+        statusText = ""
+        renderPanel()
+    end
+end
+
+local function onWebMessage(message)
+    guarded("row click", function()
+        local body = message and message.body
+        if type(body) == "table" and body.type == "click" then
+            handleRowClick(tonumber(body.index))
+        end
+    end)
+end
+
 local function buildPanel()
     if _G.clipboardMgrWebview then return end
 
-    _G.clipboardMgrWebview = webview.new(panelFrame())
+    local controller = webview.usercontent.new("clipboardMgr")
+    controller:setCallback(onWebMessage)
+
+    _G.clipboardMgrWebview = webview.new(panelFrame(), {}, controller)
         :windowStyle(0)
         :allowTextEntry(false)
         :allowNewWindows(false)
@@ -1237,6 +1361,7 @@ local function showPanel()
     statusText = ""
     panelFrameCache = nil
     panelHasInput = true
+    cmdHeld = false
     buildPanel()
     panelFrameCache = panelFrame()
     _G.clipboardMgrWebview:frame(panelFrameCache)
@@ -1260,9 +1385,20 @@ _G.clipboardMgrTimer = hs.timer.doEvery(POLL, function()
     end)
 end):start()
 
-_G.clipboardMgrKeyTap = eventtap.new({ eventtap.event.types.keyDown }, function(e)
+_G.clipboardMgrKeyTap = eventtap.new({ eventtap.event.types.keyDown, eventtap.event.types.flagsChanged }, function(e)
     return guarded("key handler", function()
         if not panelVisible then return false end
+
+        -- Holding Cmd overlays paste-by-number badges. Observe the modifier
+        -- without consuming it so Cmd-shortcuts still reach their keyDown.
+        if e:getType() == eventtap.event.types.flagsChanged then
+            local held = e:getFlags().cmd == true
+            if held ~= cmdHeld then
+                cmdHeld = held
+                renderPanel()
+            end
+            return false
+        end
 
         local key = keycodes.map[e:getKeyCode()]
         local flags = e:getFlags()
@@ -1274,15 +1410,18 @@ _G.clipboardMgrKeyTap = eventtap.new({ eventtap.event.types.keyDown }, function(
             return true
         end
 
+        -- Esc closes from anywhere, even after focus has moved to another app.
+        if key == "escape" then
+            hidePanel()
+            return true
+        end
+
         -- The panel intentionally floats while users work elsewhere. Once a
         -- click lands outside it, shortcuts like Cmd+C must pass through so new
         -- clipboard items can still be captured while the manager is visible.
         if not panelHasInput then return false end
 
-        if key == "escape" then
-            hidePanel()
-            return true
-        elseif key == "down" then
+        if key == "down" then
             moveSelection(1)
             return true
         elseif key == "up" then
@@ -1312,14 +1451,21 @@ _G.clipboardMgrKeyTap = eventtap.new({ eventtap.event.types.keyDown }, function(
         elseif key == "return" then
             pasteItem(item, false)
             return true
-        elseif key == "space" then
-            if item and item.kind == "image" then
-                quickLookItem(item)
-            else
-                detailMode = detailMode == "preview" and nil or "preview"
-                statusText = ""
+        elseif flags.cmd and key and key:match("^[1-9]$") then
+            local target = visibleFirst + tonumber(key) - 1
+            updateFiltered()
+            if filtered[target] then
+                selected = target
+                pasteItem(history[filtered[target]], true)
                 renderPanel()
             end
+            return true
+        elseif key == "space" then
+            -- `x and nil or y` always yields y in Lua, so toggle with the
+            -- truthy value first to actually hide on the second press.
+            detailMode = (detailMode ~= "preview") and "preview" or nil
+            statusText = ""
+            renderPanel()
             return true
         elseif key == "c" and flags.cmd then
             copyItem(item)
@@ -1360,7 +1506,7 @@ _G.clipboardMgrKeyTap = eventtap.new({ eventtap.event.types.keyDown }, function(
         if not hasCommand then
             local ch = e:getCharacters(true)
             if ch == "?" or ch == "/" then
-                detailMode = detailMode == "help" and nil or "help"
+                detailMode = (detailMode ~= "help") and "help" or nil
                 statusText = ""
                 renderPanel()
                 return true
