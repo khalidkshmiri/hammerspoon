@@ -55,6 +55,21 @@ mouse-driven window management plus a set of keyboard/input/automation shortcuts
 - When something "used to work" and broke, check `git log`/`git diff` before
   theorizing or adding code.
 
+## Documentation (keep it current)
+
+- Every module has a deep-dive doc at `docs/<module-name>.md` (lowercase-hyphens),
+  following the pattern set by [`docs/clipboard-manager.md`](docs/clipboard-manager.md):
+  architecture → data model → flows → full bindings table → **Mistakes & gotchas**
+  (drawn from real bugs) → debugging playbook.
+- **Update docs in the same commit as the code.** When you add or meaningfully
+  change a module, create or update its `docs/*.md` alongside the change — a doc
+  that drifts out of date is worse than none. Add newly discovered gotchas/API
+  surprises to the module's "Mistakes & gotchas" section.
+- Link each module doc from its bullet in the **Layout** section above.
+- Modules still missing docs: `window_manager`, `app_rules`, `paste_manager`,
+  `dock_quit`, `menubar_quit`, `horizontal_scroll`, `brightness_manager`,
+  `builtin_brightness_manager` — backfill in the clipboard-manager style.
+
 ## Requirements
 
 - Hammerspoon installed and running, with Accessibility permission granted
