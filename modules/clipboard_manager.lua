@@ -940,6 +940,7 @@ local function renderHTML()
   --selected: #007aff;
   --selected-muted: rgba(255, 255, 255, 0.78);
   --surface: rgba(255, 255, 255, 0.48);
+  --hover: rgba(0, 0, 0, 0.08);
 }
 
 @media (prefers-color-scheme: dark) {
@@ -952,6 +953,7 @@ local function renderHTML()
     --selected: #0a84ff;
     --selected-muted: rgba(255, 255, 255, 0.78);
     --surface: rgba(255, 255, 255, 0.08);
+    --hover: rgba(255, 255, 255, 0.14);
   }
 }
 
@@ -1197,8 +1199,9 @@ kbd {
   object-fit: contain;
 }
 
-.row:hover:not(.selected) {
-  background: var(--surface);
+.row:hover:not(.selected),
+.row.hover:not(.selected) {
+  background: var(--hover);
 }
 
 .num {
@@ -1230,6 +1233,17 @@ kbd {
 </head>
 <body>]] .. mainHTML .. [[
   <script>
+    // Borderless panels never become key, so macOS withholds mouseMoved events
+    // and native CSS :hover never fires. Lua's global mouse tap calls this with
+    // page-relative coords to light up the row under the pointer.
+    window.__hoverAt = function(x, y) {
+      var el = document.elementFromPoint(x, y);
+      var row = el && el.closest ? el.closest('.row') : null;
+      document.querySelectorAll('.row.hover').forEach(function(e) {
+        if (e !== row) e.classList.remove('hover');
+      });
+      if (row) row.classList.add('hover');
+    };
     document.querySelectorAll('.row').forEach(function(row) {
       row.addEventListener('dragstart', function(event) {
         var value = row.getAttribute('data-drag') || '';
@@ -1523,6 +1537,17 @@ _G.clipboardMgrKeyTap = eventtap.new({ eventtap.event.types.keyDown, eventtap.ev
     end, true)
 end)
 
+-- ponytail: fires evaluateJavaScript on every in-frame move; throttle by pixel
+-- delta if it ever lags.
+local function updateHover(point, frame)
+    if not _G.clipboardMgrWebview then return end
+    _G.clipboardMgrWebview:evaluateJavaScript(string.format(
+        "window.__hoverAt && window.__hoverAt(%d,%d)",
+        math.floor(point.x - frame.x),
+        math.floor(point.y - frame.y)
+    ))
+end
+
 local function isPointInFrame(point, frame)
     return point.x >= frame.x and point.x <= frame.x + frame.w
         and point.y >= frame.y and point.y <= frame.y + frame.h
@@ -1538,6 +1563,7 @@ _G.clipboardMgrMouseTap = eventtap.new({
     eventtap.event.types.leftMouseDown,
     eventtap.event.types.leftMouseDragged,
     eventtap.event.types.leftMouseUp,
+    eventtap.event.types.mouseMoved,
 }, function(e)
     if not panelVisible or not _G.clipboardMgrWebview then return false end
 
@@ -1545,6 +1571,11 @@ _G.clipboardMgrMouseTap = eventtap.new({
     local frame = panelFrameCache or _G.clipboardMgrWebview:frame()
     local flags = e:getFlags()
     local eventType = e:getType()
+
+    if eventType == eventtap.event.types.mouseMoved then
+        if isPointInFrame(point, frame) then updateHover(point, frame) end
+        return false
+    end
 
     if eventType == eventtap.event.types.leftMouseDown then
         if not isPointInFrame(point, frame) then

@@ -225,6 +225,14 @@ Lua side: `buildPanel()` attaches an `hs.webview.usercontent` controller named
 A click and a native drag are mutually exclusive in WebKit (a completed drag
 suppresses the `click`), so dragging a row out never accidentally pastes.
 
+**Hover** is driven the same way, for the same reason: a non-key window gets no
+`mouseMoved` events, so CSS `:hover` never fires. The mouse tap listens for
+`mouseMoved`, and while the pointer is inside the panel frame calls
+`updateHover(point, frame)` → `webview:evaluateJavaScript("window.__hoverAt(x,y)")`
+with page-relative coords. `__hoverAt` runs `document.elementFromPoint`, finds the
+`.row`, and toggles a `.hover` class (styled identically to `:hover`). See
+gotcha #4.
+
 ---
 
 ## 6. Keyboard handling
@@ -362,6 +370,14 @@ window. **Do not** try to read keys from the webview or add an `<input>` — it
 won't receive them. All keyboard input goes through the global key tap; that is by
 design, not a workaround waiting to be removed. It's also why the "filter query"
 is drawn by us from a Lua `query` string rather than being a real text field.
+
+The same "never the key window" fact breaks **mouse hover**: macOS delivers
+`mouseMoved` only to the key window, so native CSS `:hover` never fires (clicks
+still work — `leftMouseDown` reaches non-key windows). Hover is therefore driven
+manually from the mouse tap: `mouseMoved` → `updateHover` →
+`evaluateJavaScript("window.__hoverAt(x,y)")`, which hit-tests with
+`elementFromPoint` and toggles a `.hover` class. If hover ever "does nothing",
+this is why — don't reach for a CSS fix.
 
 ### 5. Clicks need the `usercontent` message channel
 
