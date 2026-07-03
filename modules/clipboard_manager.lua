@@ -1662,9 +1662,9 @@ local function showPanel()
     visibleFirst = 1
     detailMode = nil
     statusText = ""
-    -- Opening as a floating reference lets users keep typing in the target app
-    -- immediately; clicking into the panel is the explicit opt-in to navigate/filter.
-    panelHasInput = false
+    -- The panel is keyboard-first when opened; clicking outside is the explicit
+    -- opt-out that lets it float while ordinary app shortcuts pass through.
+    panelHasInput = true
     cmdHeld = false
     buildPanel()
     panelFrameCache = panelFrame()

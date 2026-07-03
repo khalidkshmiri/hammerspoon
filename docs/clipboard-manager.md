@@ -266,9 +266,10 @@ can detect Cmd being held for the number badges). Structure of the handler:
 3. `Hyper+V` → close. `Hyper+1`–`Hyper+9` → paste the visible numbered item while
    keeping the panel open. `Esc` → close. **These act regardless of focus** — they
    are checked *before* the `panelHasInput` gate.
-4. `if not panelHasInput: return false` — the panel now opens in this floating
-   state by default, so ordinary typing keeps going to the app underneath until
-   you click into the panel on purpose.
+4. `if not panelHasInput: return false` — opening the panel sets this to `true`,
+   so arrows, Return, Space, and filter typing work immediately. Clicking outside
+   the panel sets it to `false`, which lets ordinary typing keep going to the app
+   underneath while the list stays visible.
 5. Everything else: navigation, actions, filter typing.
 
 ### Full bindings
@@ -462,10 +463,12 @@ guard against recursion.
 
 ### 10. `panelHasInput` — the panel intentionally floats
 
-After you click outside the panel, `panelHasInput` becomes `false` and the key tap
-passes ordinary keys through (so you can keep working, and new copies still get
-captured while the list is visible). Only `Hyper+V` and `Esc` still act. If you
-expect a shortcut to work "always", it must be checked **before** the
+The panel opens with `panelHasInput = true`, so keyboard navigation and filtering
+work immediately after `Hyper+V`; users should not have to click the webview
+first. After you click outside the panel, `panelHasInput` becomes `false` and the
+key tap passes ordinary keys through (so you can keep working, and new copies
+still get captured while the list is visible). Only `Hyper+V` and `Esc` still act.
+If you expect a shortcut to work "always", it must be checked **before** the
 `panelHasInput` gate (that's exactly the fix that made `Esc` close from anywhere).
 
 ### 11. Preview width jumps are deliberate; help stays compact
