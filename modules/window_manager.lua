@@ -20,7 +20,7 @@ local EV_RUP    = types.rightMouseUp
 local EV_SCROLL = types.scrollWheel
 local max, min = math.max, math.min
 
-local SCROLL_RESIZE_SPEED   = 2    -- px of resize per px of scroll delta; negate to flip direction
+local SCROLL_RESIZE_SPEED   = 0.5  -- px of resize per px of scroll delta; negate to flip direction
 local RESIZE_MARGIN         = 20   -- px from window edge: Hyper+drag here resizes
 local DOUBLE_CLICK_INTERVAL = 0.35 -- seconds between two Hyper+clicks to count as double-click
 local TITLE_BAR_HEIGHT      = 32   -- px from window top: plain-drag intercept zone
@@ -37,7 +37,7 @@ local pendingPlainDrag = nil
 -- Scroll gesture target: locked when a scroll starts, released 0.3s after last event.
 -- The event tap only accumulates deltas; a 60fps timer flushes them to setFrame so
 -- the tap never blocks on slow-to-resize apps (Xcode, Reminders).
-local scrollTarget = { win = nil, releaseTimer = nil, updateTimer = nil, edges = nil, initFrame = nil, totalDX = 0, totalDY = 0, dirty = false }
+local scrollTarget = { window = nil, releaseTimer = nil, updateTimer = nil, edges = nil, initFrame = nil, totalDX = 0, totalDY = 0, dirty = false }
 -- Hyper state tracked via flagsChanged so click events don't race with Karabiner-Elements
 -- synthetic modifier delivery. The click event's own flags can arrive before all four
 -- modifier keys are reflected, causing isHyper to return false and the click to fall
@@ -60,7 +60,17 @@ _G.windowFilter:subscribe(hs.window.filter.windowDestroyed, function(win)
     if id and savedFrames[id] then savedFrames[id] = nil end
 end)
 
-local function isHyper() return hyperActive end
+-- Fallback to the event's own flags: hyperActive (set only by flagsChanged) can go
+-- stale when Karabiner delivers the Hyper modifiers without firing a flagsChanged
+-- event, so scroll/right-drag resize would bail while the modifiers are actually held.
+local function isHyper(event)
+    if hyperActive then return true end
+    if event then
+        local f = event:getFlags()
+        return (f.cmd and f.ctrl and f.alt and f.shift) == true
+    end
+    return false
+end
 
 -- buffer > 0 when Hyper is held so clicks in the native resize handle zone
 -- (a few px outside the logical frame) still find the window.
@@ -279,7 +289,7 @@ end
 local function resetScrollTarget()
     if scrollTarget.releaseTimer then scrollTarget.releaseTimer:stop() end
     if scrollTarget.updateTimer then scrollTarget.updateTimer:stop() end
-    scrollTarget = { win = nil, releaseTimer = nil, updateTimer = nil, edges = nil, initFrame = nil, totalDX = 0, totalDY = 0, dirty = false }
+    scrollTarget = { window = nil, releaseTimer = nil, updateTimer = nil, edges = nil, initFrame = nil, totalDX = 0, totalDY = 0, dirty = false }
 end
 
 _G.windowDragger = hs.eventtap.new({ EV_DOWN, EV_DRAG, EV_UP, EV_RDOWN, EV_RDRAG, EV_RUP, EV_SCROLL }, function(event)
@@ -289,14 +299,7 @@ _G.windowDragger = hs.eventtap.new({ EV_DOWN, EV_DRAG, EV_UP, EV_RDOWN, EV_RDRAG
     if eventType == EV_DOWN then
         dragState = {}
         pendingPlainDrag = nil
-        local hasHyper = isHyper()
-        -- Fallback for the race after a space switch: macOS emits flagsChanged during the
-        -- transition which resets hyperActive to false, but the event's own flags still
-        -- reflect the actual held modifiers. The two checks cover complementary failure modes.
-        if not hasHyper then
-            local ef = event:getFlags()
-            hasHyper = (ef.cmd and ef.ctrl and ef.alt and ef.shift) == true
-        end
+        local hasHyper = isHyper(event)
         local pos      = event:location()
         -- 2 = the second click of a native double-click. Used below to give plain
         -- title-bar double-clicks the same maximize/restore as Hyper+double-click.
@@ -510,7 +513,7 @@ _G.windowDragger = hs.eventtap.new({ EV_DOWN, EV_DRAG, EV_UP, EV_RDOWN, EV_RDRAG
     -- Uses the same 60fps timer approach as Hyper+left-drag edge resize.
     elseif eventType == EV_RDOWN then
         dragState = {}
-        if not isHyper() then return end
+        if not isHyper(event) then return end
         local pos = event:location()
         local win = getWindowAtPoint(pos, RESIZE_MARGIN)
         if not (win and not win:isFullScreen()) then return true end
@@ -550,11 +553,11 @@ _G.windowDragger = hs.eventtap.new({ EV_DOWN, EV_DRAG, EV_UP, EV_RDOWN, EV_RDRAG
     -- Each scroll event applies directly to the current frame (no canvas needed).
     -- Quadrant under the cursor determines which corner is being resized.
     elseif eventType == EV_SCROLL then
-        if not isHyper() then return end
+        if not isHyper(event) then return end
         local pos = event:location()
         -- Reuse the locked target if mid-gesture; otherwise find by position.
         -- The lock prevents losing the window when it shrinks past the cursor.
-        local win = scrollTarget.win or getWindowAtPoint(pos, RESIZE_MARGIN)
+        local win = scrollTarget.window or getWindowAtPoint(pos, RESIZE_MARGIN)
         if not (win and not win:isFullScreen()) then return true end
 
         local dx = event:getProperty(props.scrollWheelEventPointDeltaAxis2)
@@ -563,10 +566,10 @@ _G.windowDragger = hs.eventtap.new({ EV_DOWN, EV_DRAG, EV_UP, EV_RDOWN, EV_RDRAG
 
         -- On the first real scroll event: snapshot frame and lock edges.
         -- Edges are locked so the resize direction can't flip as the window grows/shrinks.
-        if not scrollTarget.win then
+        if not scrollTarget.window then
             local f = win:frame()
             local originScreen = win:screen()
-            scrollTarget.win = win
+            scrollTarget.window = win
             scrollTarget.edges = quadrantEdges(pos, f)
             scrollTarget.initFrame = { x = f.x, y = f.y, w = f.w, h = f.h }
             scrollTarget.originScreen = originScreen
