@@ -21,8 +21,7 @@ that matter most.
 
 ## Working in this repo
 
-- **Reload after a change:** `touch /Users/armand/Developer/hammerspoon/init.lua`
-  (the file watcher reloads ~0.3s later), or `hs -c 'hs.reload()'`.
+- **Reload after a change:** `hs -c 'hs.reload()'`.
 - **Verify in the live instance:** `hs -c '<lua>'`. Relaunch the Hammerspoon app
   first if you get a message-port error.
 - Errors are often swallowed by `pcall`/`xpcall` guards — when something silently

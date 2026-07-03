@@ -54,8 +54,8 @@ global event tap, not in the webview, and clicks are relayed back to Lua through
 - `~/.hammerspoon/modules` is a **symlink** to `Developer/hammerspoon/modules`.
 - Hammerspoon resolves `require`/`load` from `hs.configdir` (`~/.hammerspoon`),
   so the *symlinked* file is what runs. Editing the repo file edits the live file.
-- **Reload:** `touch /Users/armand/Developer/hammerspoon/init.lua` (the watcher in
-  `init.lua` calls `hs.reload()` ~0.3s later), or `hs -c 'hs.reload()'`.
+- **Reload:** `hs -c 'hs.reload()'`. The watcher in `init.lua` still auto-reloads
+  changed `.lua` files, but use the CLI for deliberate manual reloads.
 
 Line 1 is deliberate:
 
@@ -504,7 +504,7 @@ top" action.
 
 ```bash
 # Reload after an edit
-touch /Users/armand/Developer/hammerspoon/init.lua      # or: hs -c 'hs.reload()'
+hs -c 'hs.reload()'
 
 # Did it load clean?
 hs -c 'print(hs.console.getConsole())' | tr -d '\000' | grep -iE 'fail|error|:[0-9]+:'

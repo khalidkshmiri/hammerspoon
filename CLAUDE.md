@@ -49,8 +49,7 @@ mouse-driven window management plus a set of keyboard/input/automation shortcuts
 
 ## Working in this repo
 
-- **Reload after a change:** `touch /Users/armand/Developer/hammerspoon/init.lua`
-  (the watcher picks it up and reloads).
+- **Reload after a change:** `hs -c 'hs.reload()'`.
 - **Run Lua in the live instance** (for verification): `hs -c '<lua>'`. If you get a
   message-port error, relaunch the Hammerspoon app first.
 - When something "used to work" and broke, check `git log`/`git diff` before
