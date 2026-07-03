@@ -8,6 +8,7 @@ if _G.windowFilter  then _G.windowFilter:unsubscribeAll() end
 
 hs.window.animationDuration = 0
 local ANIMATE_DURATION = 0.2  -- seconds for maximize / restore transitions (drag stays instant)
+local axuielement = require("hs.axuielement")
 
 local types   = hs.eventtap.event.types
 local props   = hs.eventtap.event.properties
@@ -22,7 +23,7 @@ local max, min = math.max, math.min
 
 local SCROLL_RESIZE_SPEED   = 0.5  -- px of resize per px of scroll delta; negate to flip direction
 local RESIZE_MARGIN         = 20   -- px from window edge: Hyper+drag here resizes
-local DOUBLE_CLICK_INTERVAL = 0.35 -- seconds between two Hyper+clicks to count as double-click
+local DOUBLE_CLICK_INTERVAL = 0.22 -- seconds between two clicks to count as double-click
 local TITLE_BAR_HEIGHT      = 32   -- px from window top: plain-drag intercept zone
 local WINDOW_CONTROLS_WIDTH = 80   -- px from left: skip close/min/zoom buttons
 local MIN_WIN_W             = 200
@@ -183,6 +184,36 @@ local function inPlainTitleZone(pos, f)
        and pos.x <  f.x + f.w - RESIZE_MARGIN
 end
 
+local CONTROL_ROLES = {
+    AXButton = true,
+    AXCheckBox = true,
+    AXComboBox = true,
+    AXDisclosureTriangle = true,
+    AXMenuButton = true,
+    AXPopUpButton = true,
+    AXRadioButton = true,
+    AXSearchField = true,
+    AXSlider = true,
+    AXTextField = true,
+}
+
+local function pointHitsTitleBarControl(pos)
+    local ok, el = pcall(axuielement.systemElementAtPosition, pos)
+    if not ok or not el then return false end
+
+    while el do
+        local role = el:attributeValue("AXRole")
+        if CONTROL_ROLES[role] then return true end
+        if role == "AXTitleBar" or role == "AXWindow" then return false end
+
+        local parent = el:attributeValue("AXParent")
+        if not parent or parent == el then return false end
+        el = parent
+    end
+
+    return false
+end
+
 local function doMaximize(win, winId, currentF)
     local maxF = win:screen():frame()
     savedFrames[winId] = { pre = currentF, max = maxF }
@@ -326,7 +357,8 @@ _G.windowDragger = hs.eventtap.new({ EV_DOWN, EV_DRAG, EV_UP, EV_RDOWN, EV_RDRAG
             -- Hyper+double-click, replacing macOS' default zoom/minimize. Applies to
             -- any window, not just ones we previously maximized.
             local inTitleZone = inPlainTitleZone(pos, f)
-            if clickState == 2 and inTitleZone then
+            local hitsControl = inTitleZone and pointHitsTitleBarControl(pos)
+            if clickState == 2 and inTitleZone and not hitsControl then
                 lastClick = { time = 0, winId = nil }
                 if isStillMaximized(winId, f) then
                     local pre = savedFrames[winId].pre
@@ -340,7 +372,8 @@ _G.windowDragger = hs.eventtap.new({ EV_DOWN, EV_DRAG, EV_UP, EV_RDOWN, EV_RDRAG
 
             local inTitleBar = savedFrames[winId]
                            and isStillMaximized(winId, f)
-                           and inPlainTitleZone(pos, f)
+                           and inTitleZone
+                           and not hitsControl
             if not inTitleBar then return end
 
             local minX, maxX, minY, maxY = boundsOnScreen(win:screen(), f.w, f.h)

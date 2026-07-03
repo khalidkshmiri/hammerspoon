@@ -16,6 +16,7 @@ mouse-driven window management plus a set of keyboard/input/automation shortcuts
 - **`modules/`** — one feature per file:
   - `window_manager.lua` — Hyper + drag to move/resize a window; Hyper + double-click
     to toggle maximize/restore. The core feature (see README).
+    **Deep dive + gotchas: [`docs/window-manager.md`](docs/window-manager.md).**
   - `app_rules.lua` — auto-restores a saved app layout into a persistent desktop
     Space when those apps launch. Layouts are keyed by a signature of the attached
     screens (MacBook-alone vs docked are separate), so capture once per setup with
