@@ -11,6 +11,7 @@ if _G.clipboardMgrChooser then _G.clipboardMgrChooser:delete() end
 if _G.clipboardMgrKeyTap then _G.clipboardMgrKeyTap:stop() end
 if _G.clipboardMgrMouseTap then _G.clipboardMgrMouseTap:stop() end
 if _G.clipboardMgrWebview then _G.clipboardMgrWebview:delete() end
+if _G.clipboardMgrWarmTimer then _G.clipboardMgrWarmTimer:stop() end
 if _G.clipboardMgrSnapGuides then
     for _, guide in pairs(_G.clipboardMgrSnapGuides) do
         if guide then guide:delete() end
@@ -1650,6 +1651,20 @@ local function buildPanel()
         end)
 end
 
+local function warmPanel()
+    if panelVisible or _G.clipboardMgrWebview then return end
+
+    -- The panel deletes its webview on close to stay lightweight. A one-shot
+    -- hidden warmup keeps that idle-memory win while moving the first WebKit
+    -- boot and HTML render off the user's first Hyper+V press.
+    buildPanel()
+    panelFrameCache = panelFrame()
+    _G.clipboardMgrWebview:frame(panelFrameCache)
+    renderPanel()
+    _G.clipboardMgrWebview:delete(false)
+    _G.clipboardMgrWebview = nil
+end
+
 local function showPanel()
     if panelVisible and _G.clipboardMgrWebview and _G.clipboardMgrWebview:isVisible() then
         hidePanel()
@@ -1675,6 +1690,11 @@ local function showPanel()
     if _G.clipboardMgrKeyTap then _G.clipboardMgrKeyTap:start() end
     if _G.clipboardMgrMouseTap then _G.clipboardMgrMouseTap:start() end
 end
+
+_G.clipboardMgrWarmTimer = hs.timer.doAfter(0.8, function()
+    _G.clipboardMgrWarmTimer = nil
+    guarded("warm panel", warmPanel)
+end)
 
 _G.clipboardMgrTimer = hs.timer.doEvery(POLL, function()
     guarded("capture", function()

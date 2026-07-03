@@ -23,7 +23,7 @@ Four independent pieces run at once, glued together by module-level state:
 | **Poller** | `hs.timer.doEvery(0.5, …)` | Always. Watches `pb.changeCount()` and captures new clipboard contents. |
 | **Key tap** | global `hs.eventtap` on `keyDown` + `flagsChanged` | Started only while the panel is visible. Drives all keyboard interaction. |
 | **Mouse tap** | global `hs.eventtap` on left mouse down/drag/up | Started only while the panel is visible. Handles panel dragging and the "click outside to defocus" behavior. |
-| **Webview** | `hs.webview` rendering an inline HTML/CSS document | Created on show, deleted on hide. Purely a *view* — it holds no logic. |
+| **Webview** | `hs.webview` rendering an inline HTML/CSS document | Warmed once in the background shortly after load, then created on show and deleted on hide. Purely a *view* — it holds no logic. |
 
 The webview is **borderless and cannot take keyboard focus** (see gotchas). That
 single constraint explains most of the architecture: keyboard handling lives in a
@@ -202,7 +202,10 @@ incremental DOM update — the doc is small, so a full re-render is simplest).
 The position is also persisted via `hs.settings` (`clipboardMgr.frame.v1`). That
 is necessary because the panel is intentionally deleted on close to stay
 lightweight, so the next show has to rebuild both the webview and its last known
-origin from plain Lua data.
+origin from plain Lua data. To keep the first visible `Hyper+V` snappy, the
+module also does a one-shot hidden warmup shortly after load: it builds and
+renders the panel once, then deletes it again so the user does not pay the cold
+WebKit startup cost on first open.
 
 When there is no saved origin, the panel uses a "home" position: horizontally
 centered, but a little above dead-center. Dragging back near that home target
