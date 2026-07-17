@@ -21,15 +21,13 @@ local EV_RUP    = types.rightMouseUp
 local EV_SCROLL = types.scrollWheel
 local max, min = math.max, math.min
 
-local SCROLL_RESIZE_SPEED   = 0.5  -- px of resize per px of scroll delta; negate to flip direction
+local SCROLL_RESIZE_SPEED   = 1.0  -- px of resize per px of scroll delta; negate to flip direction
 local RESIZE_MARGIN         = 20   -- px from window edge: Hyper+drag here resizes
 local DOUBLE_CLICK_INTERVAL = 0.22 -- seconds between two clicks to count as double-click
 local TITLE_BAR_HEIGHT      = 32   -- px from window top: plain-drag intercept zone
 local WINDOW_CONTROLS_WIDTH = 80   -- px from left: skip close/min/zoom buttons
 local MIN_WIN_W             = 200
 local MIN_WIN_H             = 100
-local MIN_VISIBLE_X         = 100  -- min px of window width that must remain on-screen horizontally
-local MIN_VISIBLE_Y         = 30   -- min px of window height that must remain on-screen vertically
 
 local dragState   = {}
 local dragGen     = 0
@@ -130,7 +128,9 @@ end
 
 local function boundsOnScreen(screen, w, h)
     local sf = screen:frame()
-    return sf.x - w + MIN_VISIBLE_X, sf.x + sf.w - MIN_VISIBLE_X, sf.y, sf.y + sf.h - MIN_VISIBLE_Y
+    -- Keep move drags fully in the usable screen frame. If a window is larger
+    -- than the screen, pin its origin to the top-left rather than inverting bounds.
+    return sf.x, max(sf.x, sf.x + sf.w - w), sf.y, max(sf.y, sf.y + sf.h - h)
 end
 
 local function screenRect(screen)
@@ -221,7 +221,35 @@ local function doMaximize(win, winId, currentF)
     win:focus()
 end
 
+local function fallbackResizeEdges(initF, edges, dx, dy, bounds)
+    local effective = {
+        left = edges.left, right = edges.right,
+        top = edges.top, bottom = edges.bottom,
+    }
+
+    -- When the selected edge is already against a screen limit, continue an
+    -- outward resize from the opposite edge. This keeps a corner gesture useful
+    -- at display boundaries instead of making it appear to stop responding.
+    if edges.left and dx < 0 and initF.x <= bounds.left + 1 then
+        effective.left, effective.right, dx = false, true, -dx
+    elseif edges.right and dx > 0 and initF.x + initF.w >= bounds.right - 1 then
+        effective.left, effective.right, dx = true, false, -dx
+    end
+    if edges.top and dy < 0 and initF.y <= bounds.top + 1 then
+        effective.top, effective.bottom, dy = false, true, -dy
+    elseif edges.bottom and dy > 0 and initF.y + initF.h >= bounds.bottom - 1 then
+        effective.top, effective.bottom, dy = true, false, -dy
+    end
+
+    return effective, dx, dy
+end
+
 local function resizedFrame(initF, edges, dx, dy, originScreen, pointerScreen)
+    local bounds = originScreen and resizeBounds(originScreen, pointerScreen)
+    if bounds then
+        edges, dx, dy = fallbackResizeEdges(initF, edges, dx, dy, bounds)
+    end
+
     local newX, newY, newW, newH = initF.x, initF.y, initF.w, initF.h
     if edges.left then
         newW = max(MIN_WIN_W, initF.w - dx)
@@ -240,7 +268,6 @@ local function resizedFrame(initF, edges, dx, dy, originScreen, pointerScreen)
         return { x = newX, y = newY, w = newW, h = newH }
     end
 
-    local bounds = resizeBounds(originScreen, pointerScreen)
     local left = newX
     local right = newX + newW
     local top = newY

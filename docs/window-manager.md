@@ -31,7 +31,8 @@ duplicate taps or watchers.
   Defers interception of plain top-bar clicks until they become an actual drag.
 - `scrollTarget`
   Coalesces Hyper+scroll resize updates onto a timer so slow apps do not block
-  the event tap.
+  the event tap. Scroll deltas resize at 1.0 px per delta, independently from
+  the raw-pixel speed of a mouse drag.
 
 ## Flows
 
@@ -39,6 +40,10 @@ duplicate taps or watchers.
 
 - If the pointer is inside the edge margin, start resize mode.
 - Otherwise arm move mode.
+- Move mode clamps the full window to the usable frame of the screen under the
+  pointer, so Hyper-drag cannot leave part of a normally sized window off-screen.
+- When a resize edge is already at a display boundary, pushing outward switches
+  to the opposite available edge, so the gesture can continue growing inward.
 - If the window was previously maximized by this module, the first drag restores
   the saved frame while keeping the pointer anchored proportionally inside it.
 
