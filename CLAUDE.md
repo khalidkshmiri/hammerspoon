@@ -33,8 +33,8 @@ mouse-driven window management plus a set of keyboard/input/automation shortcuts
     ⌘R reveal · ⌘⌫ delete · ⌘⇧⌫ clear all · `/` or `?` compact actions sheet
     (toggle) · esc close.
     **Deep dive + gotchas: [`docs/clipboard-manager.md`](docs/clipboard-manager.md).**
-  - `dock_quit.lua` — middle-click a Dock icon to quit that app (≡ ⌘Q).
-  - `menubar_quit.lua` — middle-click a third-party menu-bar icon to quit its app.
+  - `click_quit.lua` — middle-click or Hyper-click a Dock or third-party menu-bar
+    icon to quit its app.
   - `horizontal_scroll.lua` — hold Shift while scrolling to scroll horizontally.
   - `brightness_manager.lua` / `builtin_brightness_manager.lua` — brightness control
     (external displays / built-in display).
@@ -45,8 +45,8 @@ mouse-driven window management plus a set of keyboard/input/automation shortcuts
   its event taps/hotkeys on load. To add a feature, drop a file in `modules/` and add
   a `load("modules.X")` line in `init.lua`.
 - The trigger for window/clipboard actions is the **Hyper key**
-  (Cmd+Ctrl+Opt+Shift held together). Configurable via `MODIFIER` near the top of the
-  relevant module.
+  (Cmd+Ctrl+Opt+Shift held together). Window gestures use `isHyper()` near the top of
+  `modules/window_manager.lua`; click-to-quit mirrors the same modifier check.
 
 ## Working in this repo
 
@@ -67,9 +67,9 @@ mouse-driven window management plus a set of keyboard/input/automation shortcuts
   that drifts out of date is worse than none. Add newly discovered gotchas/API
   surprises to the module's "Mistakes & gotchas" section.
 - Link each module doc from its bullet in the **Layout** section above.
-- Modules still missing docs: `window_manager`, `app_rules`, `paste_manager`,
-  `dock_quit`, `menubar_quit`, `horizontal_scroll`, `brightness_manager`,
-  `builtin_brightness_manager` — backfill in the clipboard-manager style.
+- Modules still missing docs: `app_rules`, `paste_manager`, `click_quit`,
+  `horizontal_scroll`, `brightness_manager`, `builtin_brightness_manager` — backfill
+  in the clipboard-manager style.
 
 ## Requirements
 

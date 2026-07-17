@@ -15,15 +15,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Space on launch.
 - Plain-paste manager: Cmd+V pastes without formatting, Cmd+Opt+V keeps formatting.
 - Clipboard manager: Hyper+V toggles a native-style, keyboard-driven history panel.
-  Captures text, rich text, images, files/paths and URLs (colour-coded, with image
-  thumbnails) and persists across reboots. Bindings: ↩ paste into the active window ·
-  ⌘↩ paste & keep the panel open · ⌘C copy for manual paste · ⌘Y Quick Look ·
-  ⌘S save to Desktop · ⌘R show in Finder · ⌘⇧S share · ⌘⌫ delete · ⌘⇧⌫ clear all ·
-  type to search · `?` controls overlay · esc or a click outside the panel to close.
-- Numbered quick-paste: the panel numbers the first 10 rows (1–9, 0); pressing a digit
-  pastes that item into the active window and keeps the panel open, without changing
-  history order — so you can fire off several clips in sequence.
-- Middle-click a Dock icon to quit the app; middle-click a menu-bar icon to quit its app.
+  Captures text, rich text, images, files/paths and URLs and persists across reboots.
+  Bindings: ↩ paste into the active window · ⌘↩ paste & keep the panel open · ⌘C copy
+  for manual paste · ⌘Y Quick Look · ⌘S save to Desktop · ⌘O open · ⌘R reveal in
+  Finder · ⌘⌫ delete · ⌘⇧⌫ clear all · type to search · `/` or `?` controls overlay ·
+  esc or Hyper+V to close.
+- Numbered quick-paste: hold ⌘ to show 1–9 badges, then use ⌘1–⌘9 or Hyper+1–Hyper+9
+  to paste that visible item while keeping the panel open, without changing history
+  order — so you can fire off several clips in sequence.
+- Middle-click or Hyper-click a Dock icon or menu-bar icon to quit its app.
 - Shift + scroll for horizontal scrolling anywhere.
 - Brightness managers for external (BetterDisplay CLI) and built-in displays, with a
   daily reset of built-in brightness.

@@ -17,13 +17,7 @@ Mouse-driven window management for macOS using [Hammerspoon](https://www.hammers
 
 ## Modifier key
 
-By default the trigger is the **Hyper key** (Left Cmd + Left Ctrl + Left Opt + Left Shift held simultaneously). If you want a lighter combo, change the `isHyper()` check in [modules/window_manager.lua](/Users/armand/Developer/hammerspoon/worktrees/ponytail-audit-simplify/modules/window_manager.lua:62) and the matching flag checks in [modules/click_quit.lua](/Users/armand/Developer/hammerspoon/worktrees/ponytail-audit-simplify/modules/click_quit.lua:16).
-
-```lua
-local function isHyper(flags)
-    return flags.cmd and flags.ctrl and flags.alt and flags.shift
-end
-```
+By default the trigger is the **Hyper key** (Left Cmd + Left Ctrl + Left Opt + Left Shift held simultaneously). If you want a lighter combo, change the `isHyper()` check in [modules/window_manager.lua](modules/window_manager.lua) and the matching flag checks in [modules/click_quit.lua](modules/click_quit.lua).
 
 If you use [Karabiner-Elements](https://karabiner-elements.pqrs.org) to map Caps Lock (or another key) to all four modifiers at once, the script handles the small timing gap that remappers can introduce between the click event and the modifier flags.
 
@@ -32,14 +26,16 @@ If you use [Karabiner-Elements](https://karabiner-elements.pqrs.org) to map Caps
 **Option A — direct copy:**
 ```bash
 cp init.lua ~/.hammerspoon/init.lua
+cp -R modules ~/.hammerspoon/
 ```
 
 **Option B — symlink (if you manage dotfiles):**
 ```bash
 ln -s /path/to/hammerspoon/init.lua ~/.hammerspoon/init.lua
+ln -s /path/to/hammerspoon/modules ~/.hammerspoon/modules
 ```
 
-Then reload Hammerspoon (`Cmd+R` in the Hammerspoon console, or click the menu bar icon → Reload Config). You should see a "Config loaded" alert.
+Then reload Hammerspoon with `hs -c 'hs.reload()'` (or click the menu bar icon → Reload Config). You should see a "Config loaded" alert.
 
 ## Controls
 
@@ -53,13 +49,13 @@ Then reload Hammerspoon (`Cmd+R` in the Hammerspoon console, or click the menu b
 
 ## Configuration
 
-All tuneable constants are at the top of `init.lua`:
+Window-manager constants are at the top of `modules/window_manager.lua`:
 
 | Constant | Default | Description |
 |---|---|---|
 | `isHyper()` checks | `cmd + ctrl + alt + shift` | Modifier checks used by window movement and click-to-quit handlers |
 | `RESIZE_MARGIN` | `20` px | Distance from edge where modifier+drag triggers resize instead of move |
-| `DOUBLE_CLICK_INTERVAL` | `0.35` s | Max time between two Hyper+clicks to count as a double-click |
+| `DOUBLE_CLICK_INTERVAL` | `0.22` s | Max time between two Hyper+clicks to count as a double-click |
 | `TITLE_BAR_HEIGHT` | `32` px | Height of the title bar intercept zone for restoring maximized windows |
 | `MIN_WIN_W` / `MIN_WIN_H` | `200` / `100` px | Minimum window size enforced during resize |
 | `ANIMATE_DURATION` | `0.2` s | Animation duration for maximize and restore transitions |
