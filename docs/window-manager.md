@@ -42,6 +42,10 @@ duplicate taps or watchers.
 - Otherwise arm move mode.
 - Move mode clamps the full window to the usable frame of the screen under the
   pointer, so Hyper-drag cannot leave part of a normally sized window off-screen.
+- If Finder's desktop is focused and macOS has temporarily removed app windows
+  from its visible-window list, the gesture focuses the last real window before
+  moving it. Focusing dismisses wallpaper reveal; AX ignores window-frame writes
+  while that system state remains active.
 - When a resize edge is already at a display boundary, pushing outward switches
   to the opposite available edge, so the gesture can continue growing inward.
 - If the window was previously maximized by this module, the first drag restores
@@ -90,8 +94,16 @@ duplicate taps or watchers.
 - `DOUBLE_CLICK_INTERVAL` is intentionally short. Raising it makes accidental
   window toggles much more likely when you click a top-bar control twice.
 - The click event's own modifier flags can lag behind Karabiner's synthetic
-  Hyper delivery. The separate `flagsChanged` watcher is there to avoid random
-  fallthrough into native macOS behavior.
+  Hyper delivery. The separate `flagsChanged` watcher and event-flag fallback
+  cover the usual event paths.
+- When the wallpaper is focused, `hs.window.focusedWindow()` returns Finder's
+  desktop object: an `AXScrollArea` with window ID `0` that spans the screen.
+  Lua treats `0` as truthy, so test `id() == 0` explicitly; `not id()` does not
+  identify it.
+- Golden Gate can temporarily report no visible application windows after the
+  desktop is revealed. A cursor hit-test alone then has no target, so retain and
+  focus the last real window before applying the gesture. Merely caching it is
+  insufficient because AX silently ignores frame changes during desktop reveal.
 
 ## Debugging Playbook
 

@@ -51,12 +51,27 @@ _G.hyperWatcher:start()
 -- savedFrames[winId] = { pre = frame_before_maximize, max = frame_we_set_at_maximize }
 -- Cleared when the user drags, resizes, or Hyper+double-clicks to restore.
 local savedFrames = {}
+local function isDesktopWindow(win)
+    -- Lua treats 0 as truthy, so `not win:id()` does not identify this object.
+    return win and win:role() == "AXScrollArea" and win:id() == 0
+end
+
+-- Golden Gate's desktop reveal can temporarily remove every app window from the
+-- visible-window list. Keep the last real target so a Hyper gesture from Finder's
+-- desktop still has a window to operate on.
+local initialFrontmostWindow = hs.window.frontmostWindow()
+local lastFocusedWindow = not isDesktopWindow(initialFrontmostWindow) and initialFrontmostWindow or nil
 
 -- Clean up savedFrames when a window is closed so the table doesn't grow indefinitely.
 _G.windowFilter = hs.window.filter.new()
 _G.windowFilter:subscribe(hs.window.filter.windowDestroyed, function(win)
     local id = win:id()
     if id and savedFrames[id] then savedFrames[id] = nil end
+    if lastFocusedWindow == win then lastFocusedWindow = nil end
+end)
+_G.windowFilter:subscribe(hs.window.filter.windowFocused, function(win)
+    -- Finder's desktop is an AXScrollArea, not a target window.
+    if not isDesktopWindow(win) then lastFocusedWindow = win end
 end)
 
 -- Fallback to the event's own flags: hyperActive (set only by flagsChanged) can go
@@ -76,11 +91,15 @@ end
 local function getWindowAtPoint(pos, buffer)
     buffer = buffer or 0
     local focused = hs.window.focusedWindow()
-    if focused then
+    -- When the desktop is focused, hs.window.focusedWindow() returns Finder's
+    -- full-screen AXScrollArea. It contains every point, so accepting it here
+    -- prevents the ordered-window fallback from reaching the real window below.
+    local focusedIsDesktop = isDesktopWindow(focused)
+    if focused and not focusedIsDesktop then
         local f = focused:frame()
         if pos.x >= f.x - buffer and pos.x <= f.x + f.w + buffer and
            pos.y >= f.y - buffer and pos.y <= f.y + f.h + buffer then
-            return focused
+            return focused, false
         end
     end
     for _, win in ipairs(hs.window.orderedWindows()) do
@@ -88,10 +107,17 @@ local function getWindowAtPoint(pos, buffer)
             local ok, f = pcall(function() return win:frame() end)
             if ok and f and pos.x >= f.x - buffer and pos.x <= f.x + f.w + buffer and
                             pos.y >= f.y - buffer and pos.y <= f.y + f.h + buffer then
-                return win
+                -- The displaced window can remain in orderedWindows briefly even
+                -- though Finder's desktop still owns focus and AX writes are blocked.
+                return win, focusedIsDesktop
             end
         end
     end
+    -- With Finder's desktop focused, Golden Gate can move all app windows out of
+    -- the visible list. Fall back to the last actual window rather than losing
+    -- the gesture entirely; an invalid/closed cached window is handled by the
+    -- existing protected setTopLeft/setFrame calls.
+    if focusedIsDesktop and lastFocusedWindow then return lastFocusedWindow, true end
 end
 
 local function inResizeZone(pos, f)
@@ -368,12 +394,16 @@ _G.windowDragger = hs.eventtap.new({ EV_DOWN, EV_DRAG, EV_UP, EV_RDOWN, EV_RDRAG
         -- no saved frames (it may be a fresh window to maximize).
         if not hasHyper and next(savedFrames) == nil and clickState ~= 2 then return end
 
-        local win = getWindowAtPoint(pos, hasHyper and RESIZE_MARGIN or 0)
+        local win, resumesDesktop = getWindowAtPoint(pos, hasHyper and RESIZE_MARGIN or 0)
 
         if not (win and not win:isFullScreen()) then
             if hasHyper then return true end
             return
         end
+
+        -- AX ignores frame writes while wallpaper reveal is active. Focusing the
+        -- cached window dismisses that system state before the drag starts.
+        if resumesDesktop then win:focus() end
 
         local f     = win:frame()
         local winId = win:id()
@@ -463,6 +493,11 @@ _G.windowDragger = hs.eventtap.new({ EV_DOWN, EV_DRAG, EV_UP, EV_RDOWN, EV_RDRAG
             isCmdDrag  = true,
             didDrag    = false,
             savedFrame = savedFrames[winId] and savedFrames[winId].pre,
+            resumesDesktop = resumesDesktop,
+            anchorMouseX = pos.x,
+            anchorMouseY = pos.y,
+            anchorWindowX = f.x,
+            anchorWindowY = f.y,
         }
         return true
 
@@ -536,8 +571,17 @@ _G.windowDragger = hs.eventtap.new({ EV_DOWN, EV_DRAG, EV_UP, EV_RDOWN, EV_RDRAG
         dragState.minX, dragState.maxX, dragState.minY, dragState.maxY =
             boundsOnScreen(screen, dragState.w, dragState.h)
 
-        local newX = max(dragState.minX, min(dragState.x + dx, dragState.maxX))
-        local newY = max(dragState.minY, min(dragState.y + dy, dragState.maxY))
+        local newX, newY
+        if dragState.resumesDesktop then
+            local curPos = event:location()
+            newX = dragState.anchorWindowX + curPos.x - dragState.anchorMouseX
+            newY = dragState.anchorWindowY + curPos.y - dragState.anchorMouseY
+        else
+            newX = dragState.x + dx
+            newY = dragState.y + dy
+        end
+        newX = max(dragState.minX, min(newX, dragState.maxX))
+        newY = max(dragState.minY, min(newY, dragState.maxY))
 
         local ok = pcall(dragState.window.setTopLeft, dragState.window, { x = newX, y = newY })
         if ok then
@@ -575,8 +619,9 @@ _G.windowDragger = hs.eventtap.new({ EV_DOWN, EV_DRAG, EV_UP, EV_RDOWN, EV_RDRAG
         dragState = {}
         if not isHyper(event) then return end
         local pos = event:location()
-        local win = getWindowAtPoint(pos, RESIZE_MARGIN)
+        local win, resumesDesktop = getWindowAtPoint(pos, RESIZE_MARGIN)
         if not (win and not win:isFullScreen()) then return true end
+        if resumesDesktop then win:focus() end
 
         local f     = win:frame()
         local winId = win:id()
@@ -617,8 +662,14 @@ _G.windowDragger = hs.eventtap.new({ EV_DOWN, EV_DRAG, EV_UP, EV_RDOWN, EV_RDRAG
         local pos = event:location()
         -- Reuse the locked target if mid-gesture; otherwise find by position.
         -- The lock prevents losing the window when it shrinks past the cursor.
-        local win = scrollTarget.window or getWindowAtPoint(pos, RESIZE_MARGIN)
+        local win, resumesDesktop
+        if scrollTarget.window then
+            win = scrollTarget.window
+        else
+            win, resumesDesktop = getWindowAtPoint(pos, RESIZE_MARGIN)
+        end
         if not (win and not win:isFullScreen()) then return true end
+        if resumesDesktop then win:focus() end
 
         local dx = event:getProperty(props.scrollWheelEventPointDeltaAxis2)
         local dy = event:getProperty(props.scrollWheelEventPointDeltaAxis1)
